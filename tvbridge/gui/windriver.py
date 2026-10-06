@@ -11,6 +11,7 @@ SSH session): input and screenshots only exist there.
 import ctypes
 import logging
 import os
+import re
 import struct
 import time
 import zlib
@@ -143,6 +144,22 @@ def group_words(words: List[Tuple[str, float, float, float, float]]) -> List[Tup
         cur.append(w)
     flush()
     return out
+
+
+#: Confidence given to cells of a known list row (see control_items).
+ROW_CELL_MIN_CONF = 0.6
+_ICON_PREFIX = re.compile(r"^[^A-Za-z0-9#+\-.]{1,6}\s*")   # the position/order icon before the symbol
+_CLOSE_GLYPH = re.compile(r"\s*[xX×]\s*$")            # the row's close button after the S/L cell
+
+
+def _clean_cell(text: str) -> str:
+    """Strip the icon read before a symbol and the close glyph read after a value."""
+    t = text.strip()
+    if t and not t[0].isalnum() and t[0] not in "#+-.":
+        t = _ICON_PREFIX.sub("", t)
+    if len(t) > 2 and _CLOSE_GLYPH.search(t) and any(ch.isdigit() for ch in t):
+        t = _CLOSE_GLYPH.sub("", t)
+    return t.strip()
 
 
 def drop_fragments(results: List[Any]) -> List[Any]:
@@ -665,7 +682,12 @@ class WinDriver(Driver):
                     account_placed = True
                     continue
                 for text, conf, (x, y, w, h) in res:
-                    items.append(OcrItem(text, float(conf), win.x + ox + x, win.y + oy + y, w, h))
+                    text = _clean_cell(text)
+                    if not text:
+                        continue
+                    # a known table row: its cells are real text even when the icon next to the symbol
+                    # or the row's close glyph pulls Tesseract's confidence down
+                    items.append(OcrItem(text, max(float(conf), ROW_CELL_MIN_CONF), win.x + ox + x, win.y + oy + y, w, h))
         if account_text and not account_placed and trade_list_bottom is not None:
             lx, bottom, lw = trade_list_bottom
             items.append(OcrItem(account_text, 1.0, lx + 24, bottom + 2, max(50.0, min(lw - 48, 1000.0)), 18.0))
