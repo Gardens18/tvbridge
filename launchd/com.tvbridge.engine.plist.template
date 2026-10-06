@@ -1,0 +1,57 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  tvbridge engine LaunchAgent template.
+  install.sh renders this file into ~/Library/LaunchAgents/com.tvbridge.engine.plist
+  and loads it into the logged-in GUI session (gui/<uid>). It must be a LaunchAgent,
+  not a LaunchDaemon: the engine clicks inside MetaTrader 5, which is only possible
+  from the user's Aqua session. Edit this template, not the rendered copy, then re-run
+  ./install.sh.
+-->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.tvbridge.engine</string>
+
+	<key>ProgramArguments</key>
+	<array>
+		<string>__PYTHON__</string>
+		<string>-m</string>
+		<string>tvbridge</string>
+		<string>run</string>
+	</array>
+
+	<key>WorkingDirectory</key>
+	<string>__APPDIR__</string>
+
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>TVBRIDGE_HOME</key>
+		<string>__TVBRIDGE_HOME__</string>
+		<key>PATH</key>
+		<string>/usr/bin:/bin:/usr/sbin:/sbin</string>
+		<key>PYTHONUNBUFFERED</key>
+		<string>1</string>
+	</dict>
+
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<true/>
+	<key>ThrottleInterval</key>
+	<integer>10</integer>
+	<key>ProcessType</key>
+	<string>Interactive</string>
+	<!-- Seconds launchd waits after SIGTERM before SIGKILL, so an order dialog in
+	     flight can finish and be closed cleanly. -->
+	<key>ExitTimeOut</key>
+	<integer>30</integer>
+	<key>LimitLoadToSessionType</key>
+	<string>Aqua</string>
+
+	<key>StandardOutPath</key>
+	<string>__LOGDIR__/engine.stdout.log</string>
+	<key>StandardErrorPath</key>
+	<string>__LOGDIR__/engine.stderr.log</string>
+</dict>
+</plist>

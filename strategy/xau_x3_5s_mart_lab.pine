@@ -1,0 +1,1260 @@
+//@version=6
+// XAU FABLE X3 5s  -  XAU FABLE X3 1s (v7) for a 5-SECOND chart + a RUNNER (partial take-profit) exit.
+// Why 5s and 1s give the same result: every signal comes from 10s / 30s / 3m / 5m data (request.security);
+// the chart timeframe only sets when orders are filled. The 5s chart's advantage is DEPTH: TradingView keeps
+// 5s FXCM history back to late March 2026, so the Apr-Jun months the X3 settings were NOT tuned on can be tested.
+// THE RUNNER (group "X3 5s Runner"): when the G4 target is reached, (100 - runPct)% of the position is taken there;
+//   the rest keeps running with its stop moved to entry + 0.5 pt and a 5 x ATR(30s) trailing stop (it also exits on
+//   an opposite 30s cross). From the bar after the target fill the locked stop means a runner cannot turn the trade idea
+//   into a loss, so the FundingPips 1% idea rule is unchanged (hard stop 0.9% on the full 28 oz until the target is hit).
+//   v4/v9 review fixes: target leg never carries a stop above/below the market; the runner starts only after a real
+//   profit-taking leg (any other size cut closes the rest); no runner when the target is within 0.5 pt + slippage of
+//   entry; the $15 re-entry lockout is scaled to the size of each closed leg.
+// TradingView deep backtests, FX:XAUUSD 5s, High detalization, $25k, profile A (28 oz, 0.9% stop), slippage 15 ticks:
+//                        Apr 1 - Jul 1 (not tuned on)   Jul 1 - Sep 27 (X3 tuning period)   total
+//   runner off (= X3 1s)          -505                         +9,040                      +8,535
+//   runner 50%                   +1,062                        +10,903                     +11,965
+//   runner 70% (default)         +1,794                        +11,576                     +13,370
+//   runner 90%                   +2,405                        +12,332                     +14,737
+//   Runner trail 5 x ATR tested best (3 x: -2,000 in Jul-Sep; 8 x: -1,600 in Apr-Jun). Max drawdown ~$1,800 in Apr-Jun
+//   (unchanged by the runner) - still close to the $2,500 max-loss limit if a period like April repeats.
+// Also tested on 5s and NOT made default: 5s-system gate (mode "gated by 5s"): -947 in Apr-Jun; 10s gate: -595 total;
+//   impulse guard (I max impulse 10 / 120): helps Apr-Jun without a runner, but cuts the runner's best trades.
+// RISK PROFILE (default A = funded account, Monthly payout, 1% idea cap): A = 28 oz/0.9% (Monthly payout, 1% idea cap) | B = 42 oz/1.35% + 2.5% day guard
+//   | C = B + x1.34 after a loss | D = 56 oz/1.8% + guard. TradingView 1s "Last 30 days" (to Sep 25 2026):
+//   A +4,384 / B +6,333 / C +6,818 / D +8,444 (87.5-87.8% win). Grid tested and rejected (+6,464, 2x the drawdown of D).
+// Profile A = the tested FundingPips build "F1": 28 oz, 0.9% hard stop (8.04 pt), 60 s min hold,
+//   G4 target as limit order, robust 1s latch, 10-min same-direction lockout after ANY loss.
+//   TradingView deep backtest, FX:XAUUSD 1s, Jun 28 - Sep 25 2026: 155 trades, +$8,576, 80.0% win.
+// Setting qty 30, slPct 0.95, lockFrac 0.9, min hold 0, G4 limit off, robust latch off reproduces
+//   X2 v8 (verified trade-for-trade on TradingView: 70 trades / +$5,254.20 on Aug 20 - Sep 25).
+// X3 adds (all optional, see the "X3" input groups):
+//   * min-hold before discretionary exits (FundingPips bans HFT / tick scalping) - stops stay live
+//   * G4 target as a resting limit order, G4 target multiplier, break-even after N seconds
+//   * robust 30s/5m latch for 1s charts (a 1s bar exactly at the 30s close is often missing on 1s data)
+//   * entry sessions, US-data news block, FundingPips-day loss guard / profit lock / max trades per day
+//   * equity-based sizing, capped martingale, and a capped grid basket (one combined hard stop < 1%)
+// Original notes follow.
+// XAU CONSOLIDATED F.  FX:XAUUSD.  RUN THIS ON A 5-SECOND CHART.
+// = Consolidated E + a hard stop expressed as a % of capital + a DISCIPLINED re-entry rule.
+// After a stop-out the 30s signal is usually still live, so re-entry must be EARNED by
+// something new (the fast gate breaking and re-arming, or price regaining the entry),
+// never granted automatically and never repeated without limit.
+//
+// THE RULE (from the three-chart study, Aug 17 - Sep 16 2026 exports):
+//   The 30-SECOND system (V14 MAX NET, cap 30) is the trade authority: its own
+//   entries (score cross), its own trail / protective stop / hard cap.
+//   A 30s ENTRY is taken ONLY if the 10-second AND the 5-second systems are
+//   already positioned in the same direction at that moment. If not, the entry
+//   is skipped (a flip still closes the old position). Exits are untouched.
+//   Export simulation: 30s alone 50.5% / 82.1% win / 27 losers / DD 9.7%
+//                      gated     52.5% / 91.7% win /  7 losers / DD 2.4%
+//
+// HOW IT WORKS
+//   30s engines and their 5-minute persistent layer come through request.security
+//   (lookahead OFF). Signals and stop levels are LATCHED at each closed 30-second
+//   bar (the 5s bar whose close equals the 30s bar close), so nothing inside a
+//   30s bar is seen early. The 10s system runs on 10S bars through security, the
+//   5s system natively; both keep their own simulated stops so their direction
+//   state is always current. No date gate. Runs live as written.
+strategy("XAU X3 5s MART LAB", overlay = true, initial_capital = 25000,
+     default_qty_type = strategy.fixed, default_qty_value = 20,
+     commission_value = 0, slippage = 15, pyramiding = 0,
+     margin_long = 0, margin_short = 0,
+     calc_on_every_tick = false, process_orders_on_close = false,
+     fill_orders_on_standard_ohlc = true, max_bars_back = 5000)
+
+G0 = "Rule"
+M_30  = "30s ONLY      (V14 MAX NET, cap 30 - validation baseline)"
+M_G2  = "30s gated by 10s AND 5s   (the rule)"
+M_G10 = "30s gated by 10s only"
+M_G5  = "30s gated by 5s only"
+M_G1  = "30s gated by 10s OR 5s"
+pxScale = input.float(1.0, "Point scale for price-denominated inputs (1 = XAUUSD; about 0.012 for XAGUSD)", minval = 0.0001, step = 0.001, group = G0)
+mode  = input.string(M_30, "MODE", options = [M_G2, M_30, M_G10, M_G5, M_G1], group = G0)
+qtyIn = input.int(28, "Contracts (20 = 0.2 lot) - used by the Custom risk profile", minval = 1, group = G0)
+cap30In = input.float(20.0, "30s hard cap, points (0 = off)", minval = 0.0, step = 1.0, group = G0)
+cap30 = cap30In * pxScale
+bePtsIn = input.float(0.0, "Break-even: after this many points in profit the stop can never be worse than entry (0 = off)", minval = 0.0, step = 0.5, group = G0)
+bePts = bePtsIn * pxScale
+lockPIn = input.float(0.0, "Lock-in: after break-even arms, keep the stop this many points INTO profit (0 = at entry)", minval = 0.0, step = 0.5, group = G0)
+lockP = lockPIn * pxScale
+pcMin = input.int(0, "Progress check: minutes after entry (0 = off)", minval = 0, group = G0)
+pcPtsIn = input.float(2.0, "Progress check: close if best favourable move is still below this many points", minval = 0.0, step = 0.5, group = G0)
+pcPts = pcPtsIn * pxScale
+G1 = "Risk and re-entry"
+slPctIn = input.float(0.9, "Hard stop, % of initial capital (Custom profile) (0 = off, use the points cap only)", minval = 0.0, step = 0.1, group = G1)
+R_BOTH = "GATE + RECLAIM   gate must re-arm AND price regain the entry"
+R_OFF  = "OFF              one entry per signal episode, never re-enter"
+R_FRSH = "FRESH CROSS      re-enter on a new 30s cross (E behaviour)"
+R_GATE = "GATE RE-ARM      10s+5s must break alignment then re-align"
+R_PRC  = "PRICE RECLAIM    price must regain the episode entry price"
+reMode = input.string(R_FRSH, "Re-entry after an exit while the signal is still live", options = [R_BOTH, R_OFF, R_FRSH, R_GATE, R_PRC], group = G1)
+reMax  = input.int(0, "Max re-entries per episode (0 = unlimited)", minval = 0, group = G1)
+// Funding Pips rule: after an exit taken to respect the 1 % per-trade floating drawdown limit,
+// the same trade may not be re-entered for this many minutes. This is a firm rule, not a filter.
+lockMin  = input.int(10, "Lockout after a hard-stop exit, minutes (firm rule)", minval = 0, group = G1)
+lockBoth = input.bool(false, "Lockout blocks BOTH directions (off = same direction only)", group = G1)
+lockFrac = input.float(0.05, "An exit counts as a hard stop when its loss is at least this fraction of the stop", minval = 0.01, maxval = 1.0, step = 0.05, group = G1)
+G3 = "X3  1s + FundingPips"
+minHoldS  = input.int(60, "Min hold before discretionary exits, seconds (HFT safety, 0 = off)", minval = 0, group = G3)
+g4Limit   = input.bool(true, "G4 target as a resting limit order (no slippage)", group = G3)
+g4TgtMult = input.float(1.0, "G4 target multiplier", minval = 0.1, step = 0.05, group = G3)
+beAfterS  = input.int(0, "Break-even arms only after this many seconds in the trade (0 = immediately)", minval = 0, group = G3)
+robLatch  = input.bool(true, "Robust 30s/5m latch (latch on the HTF bar change; recommended on 1s)", group = G3)
+useSess1  = input.bool(false, "New entries only in window 1", inline = "s1", group = G3)
+sess1     = input.session("0600-2100", "", inline = "s1", group = G3)
+useSess2  = input.bool(false, "or in window 2", inline = "s2", group = G3)
+sess2     = input.session("0000-0000", "", inline = "s2", group = G3)
+sessTz    = input.string("UTC", "Entry window timezone", group = G3)
+newsBlock = input.bool(false, "Block new entries 08:25-08:40, 09:55-10:10, 13:55-14:10 New York (Mon-Fri)", group = G3)
+dayLossIn = input.float(0.0, "Daily loss guard, % (Custom profile) (FundingPips day 00:00 UTC+3, incl. floating; 0 = off)", minval = 0.0, step = 0.1, group = G3)
+dayProfPct = input.float(0.0, "Daily profit lock, % (0 = off)", minval = 0.0, step = 0.1, group = G3)
+maxTrDay  = input.int(0, "Max new trades per day (0 = unlimited)", minval = 0, group = G3)
+riskPct   = input.float(0.0, "Size by risk: % of current equity per trade (0 = fixed contracts)", minval = 0.0, step = 0.05, group = G3)
+martMultIn = input.float(1.0, "Martingale (Custom profile): size x this after each consecutive loss (1 = off)", minval = 1.0, step = 0.1, group = G3)
+martMaxKIn = input.int(0, "Martingale (Custom profile): max steps", minval = 0, group = G3)
+G5 = "X3  Grid basket"
+gridN     = input.int(0, "Grid legs added on adverse moves (0 = off)", minval = 0, maxval = 5, group = G5)
+gridStepIn  = input.float(4.0, "Grid spacing, points", minval = 0.1, step = 0.5, group = G5)
+gridStep = gridStepIn * pxScale
+gridMult  = input.float(1.0, "Grid leg size multiplier", minval = 1.0, step = 0.1, group = G5)
+gridCapPct = input.float(0.9, "Basket hard stop, % of initial capital (combined loss)", minval = 0.1, step = 0.05, group = G5)
+gridTpIn    = input.float(0.0, "Basket take-profit beyond average price, points (0 = keep G4 exit)", minval = 0.0, step = 0.25, group = G5)
+gridTp = gridTpIn * pxScale
+G6 = "X3  Extra management"
+maxHoldMin = input.int(0, "Max holding time, minutes (0 = off)", minval = 0, group = G6)
+newsFlat   = input.bool(false, "Flat + no new entries around US data times (08:30 / 10:00 / 14:00 New York, Mon-Fri)", group = G6)
+newsPre    = input.int(6, "News window: minutes before", minval = 0, group = G6)
+newsPost   = input.int(6, "News window: minutes after", minval = 0, group = G6)
+friFlat    = input.bool(true, "Flat before the weekend (Fri 16:45 New York) and no entries after Fri 16:00", group = G6)
+maxLossDay = input.int(0, "Stop for the day after N losing trades (0 = off)", minval = 0, group = G6)
+quietPtsIn = input.float(0.0, "Quiet-tape block: no new entries while the last 15 closed 1-min bars span less than this many points (0 = off; in-sample only - failed the May 2026 out-of-sample test)", minval = 0.0, step = 0.25, group = G6)
+breakFlat  = input.bool(false, "Mon-Thu: no entries from 16:45 NY, flat at 16:55 NY (before the daily 17:00 break)", group = G6)
+reopenMin  = input.int(5, "No new entries for N minutes after the 18:00 NY reopen (0 = off)", minval = 0, group = G6)
+reopenSun  = input.bool(true, "Reopen guard only at the Sunday weekly open (wide reopen spreads)", group = G6)
+G7 = "X3 5s  Runner (partial take-profit at the G4 target) + trend filter"
+runPct    = input.int(70, "Runner: % of the position kept past the G4 target (0 = off = X3 1s behaviour)", minval = 0, maxval = 90, step = 5, group = G7)
+runNeed   = input.string("30s trend", "Keep a runner only when", options = ["Always", "30s trend", "30s + 10s + 5s"], group = G7,
+     tooltip = "30s trend (default, tested): the 30s V14 score must still be on the trade's side when the target is hit. '30s + 10s + 5s' also needs the fast systems; on a 1s chart the '5s' system runs on 1-second bars, so that option behaves differently on 1s and 5s charts.")
+runLockIn = input.float(0.5, "Runner stop, points beyond entry (set once the target part is taken)", minval = 0.0, step = 0.25, group = G7)
+runTgtX   = input.float(0.0, "Runner target, x the G4 target distance from entry (0 = none: trail / 30s flip / time only)", minval = 0.0, step = 0.5, group = G7)
+runMaxMin = input.int(0, "Runner max time after the partial, minutes (0 = off)", minval = 0, group = G7)
+runTrlX   = input.float(5.0, "Runner trailing stop, x 30s ATR behind the best price (0 = keep the normal 30s trail)", minval = 0.0, step = 0.5, group = G7)
+p5Must    = input.bool(false, "Entries need the 5-minute persistent trend to AGREE (off = only not opposed)", group = G7)
+lockUsd    = input.float(15.0, "Lockout also after closes below this TradingView profit, USD (commission + live spread; FundingPips 10-min idea rule)", minval = 0.0, group = G6)
+G4R = "X3  Risk profile (FundingPips 2-Step Standard $25k)"
+RP_A = "A  Monthly payout cycle (1% idea cap): 28 oz, 0.9% stop"
+RP_B = "B  Bi-Weekly / On-Demand payout: 42 oz, 1.35%, day guard 2.5%"
+RP_C = "C  = B + x1.34 size on the trade after a loss"
+RP_D = "D  Aggressive: 56 oz, 1.8%, day guard 2.5%"
+RP_X = "Custom (use the inputs above/below)"
+riskProfile = input.string(RP_A, "Risk profile", options = [RP_A, RP_B, RP_C, RP_D, RP_X], group = G4R,
+     tooltip = "All profiles keep the same 8.04-point hard stop; only the size changes. The 1% per-trade-idea Striking System applies on a $25k Master only while the reward cycle is Monthly -> use A there. B/C/D are for the evaluation phases and Bi-Weekly / On-Demand Master accounts (limits: 5% daily, 10% max loss).")
+qty        = riskProfile == RP_A ? 28 : riskProfile == RP_B or riskProfile == RP_C ? 42 : riskProfile == RP_D ? 56 : qtyIn
+slPct      = riskProfile == RP_A ? 0.9 : riskProfile == RP_B or riskProfile == RP_C ? 1.35 : riskProfile == RP_D ? 1.8 : slPctIn
+dayLossPct = riskProfile == RP_X ? dayLossIn : riskProfile == RP_A ? 0.0 : 2.5
+martMult   = riskProfile == RP_C ? 1.34 : riskProfile == RP_X ? martMultIn : 1.0
+martMaxK   = riskProfile == RP_C ? 1 : riskProfile == RP_X ? martMaxKIn : 0
+// fast-system constants (Consolidated C frozen values; no overrides in this script)
+mustAgree = false
+capOv = 0.0
+thrOv = 0.0
+xnOv  = 0.0
+reArm = false
+xitVote = 0.0
+pad10E = 5.5
+
+// ============================ PRIMITIVES ============================
+mEma(src, len) =>
+    a = 2.0 / (math.max(1.0, len) + 1.0)
+    var float e = na
+    e := na(e) ? src : e + a * (src - e)
+    e
+
+mRma(src, len) =>
+    a = 1.0 / math.max(1.0, len)
+    var float r = na
+    r := na(r) ? src : r + a * (src - r)
+    r
+
+mAtr(len) => mRma(ta.tr(true), len)
+
+mDmi(len) =>
+    up  = ta.change(high)
+    dn  = -ta.change(low)
+    pDM = na(up) or na(dn) ? 0.0 : (up > dn and up > 0 ? up : 0.0)
+    mDM = na(up) or na(dn) ? 0.0 : (dn > up and dn > 0 ? dn : 0.0)
+    tr  = mRma(ta.tr(true), len)
+    pdi = tr == 0 ? 0.0 : 100.0 * mRma(pDM, len) / tr
+    mdi = tr == 0 ? 0.0 : 100.0 * mRma(mDM, len) / tr
+    pdi > mdi ? 1 : 0
+
+// ============================ ENGINES ============================
+ehma(s, n) => mEma(2 * mEma(s, int(n / 2)) - mEma(s, n), int(math.round(math.sqrt(n))))
+
+fHull(n, slp) =>
+    h = ehma(close, n)
+    h > h[slp] ? 1 : 0
+
+fSqz(n) =>
+    v = ta.linreg(close - math.avg(math.avg(ta.highest(high, n), ta.lowest(low, n)), ta.sma(close, n)), n, 0)
+    v > 0 ? 1 : 0
+
+fUT(aL, key) =>
+    a  = mAtr(aL)
+    var float st = na
+    p  = nz(st[1], close)
+    nl = key * a
+    st := close > p and close[1] > p ? math.max(p, close - nl) : close < p and close[1] < p ? math.min(p, close + nl) : close > p ? close - nl : close + nl
+    close > st ? 1 : 0
+
+fRF(per, mult) =>
+    dab = math.abs(close - close[1])
+    rng = mEma(mEma(dab, per), per * 2 - 1) * mult
+    var float fl = na
+    pf  = nz(fl[1], close)
+    fl := close > pf ? (close - rng < pf ? pf : close - rng) : (close + rng > pf ? pf : close + rng)
+    fl > pf ? 1 : fl < pf ? 0 : (close > fl ? 1 : 0)
+
+fChand(aL, mult) =>
+    a = mult * mAtr(aL)
+    var float ls = na
+    var float ss = na
+    var int   dr = 1
+    lb = ta.highest(close, aL) - a
+    sb = ta.lowest(close, aL) + a
+    pl = nz(ls[1], lb)
+    ps = nz(ss[1], sb)
+    ls := close[1] > pl ? math.max(lb, pl) : lb
+    ss := close[1] < ps ? math.min(sb, ps) : sb
+    dr := close > ps ? 1 : close < pl ? -1 : nz(dr[1], 1)
+    [dr == 1 ? 1 : 0, ls, ss]
+
+// vote bundle for one system on the timeframe it is evaluated on
+f_vote(al, asl, bl, ca, ck, dp, dm, el, em, hl, xl, xa, atl) =>
+    a = fHull(al, asl)
+    b = fSqz(bl)
+    c = fUT(ca, ck)
+    d = fRF(dp, dm)
+    [e, ls, ss] = fChand(el, em)
+    f = mDmi(hl)
+    sc  = a + b + c + 3 * d + e + f
+    str = (close - mEma(close, xl)) / mAtr(xa)
+    [sc, ls, ss, str, mAtr(atl), high, low, close, time]
+
+// persistent trend vote (evaluated on the persistent timeframe)
+f_pers(al, asl, bl, ca, ck, dp, dm, el, em, hl) =>
+    a = fHull(al, asl)
+    b = fSqz(bl)
+    c = fUT(ca, ck)
+    d = fRF(dp, dm)
+    [e, l, s] = fChand(el, em)
+    f = mDmi(hl)
+    a + b + c + 3 * d + e + f
+
+// ============================ FROZEN PARAMETER SETS ============================
+// --- 10-SECOND system (V5-FROZEN values, verified +76.48% with 0.30 pt cost) ---
+A10 = 1800,  AS10 = 120,  B10 = 1050, C10 = 120,  CK10 = 20.8
+D10 = 230,   DM10 = 110.0, E10 = 12,  EM10 = 31.9, F10 = 150
+XL10 = 1800, XA10 = 200,  AT10 = 50
+ACT10 = 12.0, TRL10 = 2.65, PAD10 = 5.5, CAP10 = 30.0, XN10 = 10.0
+QA10 = 600, QAS10 = 40, QB10 = 350, QC10 = 40, QCK10 = 12.0
+QD10 = 77,  QDM10 = 63.5, QE10 = 4, QEM10 = 18.4, QF10 = 50
+
+// --- 5-SECOND system (V2-NATIVE, hz 1.72 / vs 1.53, verified +72.80% on its own chart) ---
+A1 = 3715, AS1 = 248, B1 = 2167, C1 = 248, CK1 = 31.824
+D1 = 475,  DM1 = 168.3, E1 = 24, EM1 = 48.807, F1 = 310
+XL1 = 3715, XA1 = 400, AT1 = 100
+ACT1 = 10.71, TRL1 = 3.978, PAD1 = 12.24, CAP1 = 30.0, XN1 = 10.0
+QA1 = 619, QAS1 = 41, QB1 = 361, QC1 = 41, QCK1 = 12.0016
+QD1 = 79,  QDM1 = 63.47, QE1 = 4, QEM1 = 18.4063, QF1 = 52
+
+THR = 7.0
+TOT = 8.0
+THRE   = thrOv > 0.0 ? thrOv : THR
+xn1E   = xnOv  > 0.0 ? xnOv  : XN1
+xn10E  = xnOv  > 0.0 ? xnOv  : XN10
+cap1E  = capOv > 0.0 ? capOv : CAP1
+cap10E = capOv > 0.0 ? capOv : CAP10
+
+// ============================ DATA FEEDS ============================
+// 1-second system, native on this chart
+[s1, ls1, ss1, st1, atr1, h1, l1, c1, t1] = f_vote(A1, AS1, B1, C1, CK1, D1, DM1, E1, EM1, F1, XL1, XA1, AT1)
+
+// 10-second system, on 10S bars, non-repainting
+[s10, ls10, ss10, st10, atr10, h10, l10, c10, t10] = request.security(syminfo.tickerid, "10S", f_vote(A10, AS10, B10, C10, CK10, D10, DM10, E10, EM10, F10, XL10, XA10, AT10), gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_off)
+
+// persistent 3-minute vetoes, one per system, top level (no nesting)
+p1raw  = request.security(syminfo.tickerid, "3", f_pers(QA1, QAS1, QB1, QC1, QCK1, QD1, QDM1, QE1, QEM1, QF1), gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_off)
+p10raw = request.security(syminfo.tickerid, "3", f_pers(QA10, QAS10, QB10, QC10, QCK10, QD10, QDM10, QE10, QEM10, QF10), gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_off)
+
+pDir1  = p1raw  >= THR ? 1 : p1raw  <= TOT - THR ? -1 : 0
+pDir10 = p10raw >= THR ? 1 : p10raw <= TOT - THR ? -1 : 0
+var int pT1  = 0
+var int pT10 = 0
+if not na(pDir1)
+    pT1 := pDir1
+if not na(pDir10)
+    pT10 := pDir10
+
+// ============================ EXIT AUTHORITY ============================
+// The system that owns the exit submits REAL orders (native protective stop +
+// native trailing stop). Its hand-rolled level test is used only while we are flat,
+// so its direction state keeps advancing even on signals we did not trade.
+tk        = syminfo.mintick
+authIsOne = false
+simX1     = true
+simX10    = true
+
+// ============================ 1-SECOND STATE MACHINE (native) ============================
+var int   q1   = 0
+var float ep1  = na
+var float hw1  = na
+var bool  arm1 = false
+var float lvl1 = na
+
+up1 = s1 >= THRE         and s1[1] <  THRE
+dn1 = s1 <= (TOT - THRE) and s1[1] >  (TOT - THRE)
+al1 = mustAgree ? pT1 ==  1 : pT1 != -1
+as1 = mustAgree ? pT1 == -1 : pT1 !=  1
+xl1 = st1 <  xn1E
+xs1 = st1 > -xn1E
+
+// 1) last bar's protective level against this bar's range
+if q1 != 0 and not na(lvl1) and simX1
+    if (q1 > 0 and low <= lvl1) or (q1 < 0 and high >= lvl1)
+        q1   := 0
+        arm1 := false
+        lvl1 := na
+
+// 2) arm / high-water from this bar, then publish the level for the next bar
+if q1 != 0 and not na(ep1)
+    if not arm1
+        if q1 > 0 and high >= ep1 + ACT1 * atr1
+            arm1 := true
+            hw1  := high
+        if q1 < 0 and low <= ep1 - ACT1 * atr1
+            arm1 := true
+            hw1  := low
+    if arm1
+        hw1 := q1 > 0 ? math.max(hw1, high) : math.min(hw1, low)
+    stopRaw1 = q1 > 0 ? ls1 - PAD1 * atr1 : ss1 + PAD1 * atr1
+    capLvl1  = q1 > 0 ? ep1 - cap1E : ep1 + cap1E
+    base1    = q1 > 0 ? math.max(stopRaw1, capLvl1) : math.min(stopRaw1, capLvl1)
+    trl1     = arm1 ? (q1 > 0 ? hw1 - TRL1 * atr1 : hw1 + TRL1 * atr1) : na
+    lvl1 := na(trl1) ? base1 : (q1 > 0 ? math.max(base1, trl1) : math.min(base1, trl1))
+
+// early exit on vote decay (5s authority)
+if xitVote > 0.0 and q1 > 0 and s1 <= xitVote
+    q1 := 0
+    arm1 := false
+    lvl1 := na
+if xitVote > 0.0 and q1 < 0 and s1 >= (TOT - xitVote)
+    q1 := 0
+    arm1 := false
+    lvl1 := na
+
+// 3) entries / flips on the score cross
+if q1 > 0
+    if dn1 and as1 and xs1
+        q1 := -1
+        ep1 := close
+        arm1 := false
+        lvl1 := na
+    else if dn1 and as1
+        q1 := 0
+        arm1 := false
+        lvl1 := na
+else if q1 < 0
+    if up1 and al1 and xl1
+        q1 := 1
+        ep1 := close
+        arm1 := false
+        lvl1 := na
+    else if up1 and al1
+        q1 := 0
+        arm1 := false
+        lvl1 := na
+else
+    if up1 and al1
+        q1 := 1
+        ep1 := close
+        arm1 := false
+        lvl1 := na
+    else if dn1 and as1
+        q1 := -1
+        ep1 := close
+        arm1 := false
+        lvl1 := na
+
+// ============================ 10-SECOND STATE MACHINE ============================
+// Signals AND level updates step once per closed 10-second bar, exactly as they do
+// on the live 10-second chart. The level is then TESTED on every 1-second bar and is
+// submitted as a real stop order, so fills happen AT the level, not at a bar close.
+var int   q10   = 0
+var float ep10  = na
+var float hw10  = na
+var bool  arm10 = false
+var float lvl10 = na
+var float sPrev = na
+var int   lastDir10    = 0
+var bool  lastProfit10 = false
+
+newBar10 = not na(t10) and (na(t10[1]) or t10 != t10[1])
+
+// 1) the standing level against this 1-second bar
+if q10 != 0 and not na(lvl10) and simX10
+    if (q10 > 0 and low <= lvl10) or (q10 < 0 and high >= lvl10)
+        q10   := 0
+        arm10 := false
+        lvl10 := na
+
+// 2) once per closed 10-second bar: signals, then refresh the level from 10s data
+if newBar10
+    up10 = not na(sPrev) and s10 >= THRE         and sPrev <  THRE
+    dn10 = not na(sPrev) and s10 <= (TOT - THRE) and sPrev >  (TOT - THRE)
+    al10 = mustAgree ? pT10 ==  1 : pT10 != -1
+    as10 = mustAgree ? pT10 == -1 : pT10 !=  1
+    xl10 = st10 <  xn10E
+    xs10 = st10 > -xn10E
+    prevQ10 = q10
+    // early exit on vote decay: the confluence that put us in has broken, do not wait for the full cross
+    if xitVote > 0.0 and q10 > 0 and s10 <= xitVote
+        q10 := 0
+        arm10 := false
+        lvl10 := na
+    if xitVote > 0.0 and q10 < 0 and s10 >= (TOT - xitVote)
+        q10 := 0
+        arm10 := false
+        lvl10 := na
+    if q10 > 0
+        if dn10 and as10 and xs10
+            q10 := -1
+            ep10 := close
+            arm10 := false
+            lvl10 := na
+        else if dn10 and as10
+            q10 := 0
+            arm10 := false
+            lvl10 := na
+    else if q10 < 0
+        if up10 and al10 and xl10
+            q10 := 1
+            ep10 := close
+            arm10 := false
+            lvl10 := na
+        else if up10 and al10
+            q10 := 0
+            arm10 := false
+            lvl10 := na
+    else
+        if up10 and al10
+            q10 := 1
+            ep10 := close
+            arm10 := false
+            lvl10 := na
+        else if dn10 and as10
+            q10 := -1
+            ep10 := close
+            arm10 := false
+            lvl10 := na
+    if q10 != prevQ10
+        lastDir10 := 0
+    // A. RE-ARM: the last position was closed by the broker (trail / stop) IN PROFIT,
+    //    the score is still at or beyond the entry threshold and the vetoes still agree
+    //    -> get back in without waiting for a fresh cross.
+    if reArm and q10 == 0 and lastDir10 != 0 and lastProfit10
+        if lastDir10 > 0 and s10 >= THRE and al10 and xl10
+            q10 := 1
+            ep10 := close
+            arm10 := false
+            lvl10 := na
+            lastProfit10 := false
+        else if lastDir10 < 0 and s10 <= (TOT - THRE) and as10 and xs10
+            q10 := -1
+            ep10 := close
+            arm10 := false
+            lvl10 := na
+            lastProfit10 := false
+    entered10 = q10 != 0 and q10 != prevQ10
+    if q10 != 0 and not na(ep10)
+        if not entered10
+            if not arm10
+                if q10 > 0 and h10 >= ep10 + ACT10 * atr10
+                    arm10 := true
+                    hw10  := h10
+                if q10 < 0 and l10 <= ep10 - ACT10 * atr10
+                    arm10 := true
+                    hw10  := l10
+            if arm10
+                hw10 := q10 > 0 ? math.max(hw10, h10) : math.min(hw10, l10)
+        stopRaw10 = q10 > 0 ? ls10 - pad10E * atr10 : ss10 + pad10E * atr10
+        capLvl10  = q10 > 0 ? ep10 - cap10E : ep10 + cap10E
+        base10    = q10 > 0 ? math.max(stopRaw10, capLvl10) : math.min(stopRaw10, capLvl10)
+        trl10     = arm10 ? (q10 > 0 ? hw10 - TRL10 * atr10 : hw10 + TRL10 * atr10) : na
+        lvl10 := na(trl10) ? base10 : (q10 > 0 ? math.max(base10, trl10) : math.min(base10, trl10))
+    else
+        lvl10 := na
+    sPrev := s10
+
+
+// ============================ 30-SECOND SYSTEM (V14 MAX NET, verbatim engines) ============================
+vHull(n, slp) =>
+    h = ta.ema(2 * ta.ema(close, int(n / 2)) - ta.ema(close, n), int(math.round(math.sqrt(n))))
+    h > h[slp] ? 1 : 0
+vSqz(n) =>
+    v = ta.linreg(close - math.avg(math.avg(ta.highest(high, n), ta.lowest(low, n)), ta.sma(close, n)), n, 0)
+    v > 0 ? 1 : 0
+vUT(aL, key) =>
+    a = ta.atr(aL)
+    var float st = na
+    p = nz(st[1], close)
+    nl = key * a
+    st := close > p and close[1] > p ? math.max(p, close - nl) : close < p and close[1] < p ? math.min(p, close + nl) : close > p ? close - nl : close + nl
+    close > st ? 1 : 0
+vRF(per, mult) =>
+    dab = math.abs(close - close[1])
+    rng = ta.ema(ta.ema(dab, per), per * 2 - 1) * mult
+    var float fl = na
+    pf = nz(fl[1], close)
+    fl := close > pf ? (close - rng < pf ? pf : close - rng) : (close + rng > pf ? pf : close + rng)
+    fl > pf ? 1 : fl < pf ? 0 : (close > fl ? 1 : 0)
+vChand(aL, mult) =>
+    a = mult * ta.atr(aL)
+    var float ls = na
+    var float ss = na
+    var int dr = 1
+    lb = ta.highest(close, aL) - a
+    sb = ta.lowest(close, aL) + a
+    pl = nz(ls[1], lb)
+    ps = nz(ss[1], sb)
+    ls := close[1] > pl ? math.max(lb, pl) : lb
+    ss := close[1] < ps ? math.min(sb, ps) : sb
+    dr := close > ps ? 1 : close < pl ? -1 : nz(dr[1], 1)
+    [dr == 1 ? 1 : 0, ls, ss]
+vDMI(n) =>
+    [dp, dm, ax] = ta.dmi(n, n)
+    dp > dm ? 1 : 0
+// MAX NET: wD 2, thr 6 of 7, persistent 5-minute NOT-opposed, pThr 6, exits act 4.0 / trl 1.75 / ATR 14 / pad 4.0
+V_WD = 2
+V_THR = 6.0
+V_TOT = 7.0
+V_PTHR = 6.0
+G2 = "Exit engine (30s)"
+V_ACT = input.float(7.0, "Trail activation, x ATR", minval = 0.25, step = 0.25, group = G2)
+V_TRL = input.float(1.75, "Trail offset, x ATR", minval = 0.25, step = 0.25, group = G2)
+V_PAD = input.float(4.0, "Chandelier pad, x ATR", minval = 0.5, step = 0.5, group = G2)
+f_v14() =>
+    a = vHull(600, 40)
+    b = vSqz(350)
+    c = vUT(60, 12)
+    d = vRF(50, 90)
+    [e, l, s] = vChand(8, 16)
+    f = vDMI(50)
+    [a + b + c + V_WD * d + e + f, l, s, ta.atr(14), time_close]
+f_v14p() =>
+    a = vHull(600, 40)
+    b = vSqz(350)
+    c = vUT(60, 12)
+    d = vRF(50, 90)
+    [e, l, s] = vChand(8, 16)
+    f = vDMI(50)
+    [a + b + c + V_WD * d + e + f, time_close]
+[s30raw, ls30raw, ss30raw, atr30raw, tc30] = request.security(syminfo.tickerid, "30S", f_v14(), gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_off)
+[p30raw, tcP]                              = request.security(syminfo.tickerid, "5",   f_v14p(), gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_off)
+
+// persistent trend, frozen until the 5-minute bar closes (V14 pHold), read on the 5s bar that closes it
+var int pT30 = 0
+var int lastPClose = na
+pDir30 = p30raw >= V_PTHR ? 1 : p30raw <= V_TOT - V_PTHR ? -1 : 0
+if not na(tcP) and (tcP == time_close or robLatch) and (na(lastPClose) or tcP != lastPClose)
+    lastPClose := tcP
+    pT30 := pDir30
+allowL30 = p5Must ? pT30 == 1 : pT30 != -1
+allowS30 = p5Must ? pT30 == -1 : pT30 != 1
+
+// 30s bar close detected on the 5s bar whose close equals the 30s bar close; values LATCHED there
+var int lastTc30 = na
+var float s30 = na
+var float s30p = na
+var float ls30 = na
+var float ss30 = na
+var float atr30 = na
+newBar30 = false
+if not na(tc30) and (tc30 == time_close or robLatch) and (na(lastTc30) or tc30 != lastTc30)
+    // exact close bar
+    lastTc30 := tc30
+    s30p := s30
+    s30 := s30raw
+    ls30 := ls30raw
+    ss30 := ss30raw
+    atr30 := atr30raw
+    newBar30 := true
+else if not na(tc30) and not na(tc30[1]) and tc30 != tc30[1] and (na(lastTc30) or tc30[1] != lastTc30)
+    // a 5s bar was missing at the 30s close: latch the previous 30s bar's values now
+    lastTc30 := tc30[1]
+    s30p := s30
+    s30 := s30raw[1]
+    ls30 := ls30raw[1]
+    ss30 := ss30raw[1]
+    atr30 := atr30raw[1]
+    newBar30 := true
+up30 = newBar30 and not na(s30p) and s30 >= V_THR and s30p < V_THR
+dn30 = newBar30 and not na(s30p) and s30 <= (V_TOT - V_THR) and s30p > (V_TOT - V_THR)
+
+// ============================ THE RULE ============================
+pos = strategy.position_size
+avgP = strategy.position_avg_price
+// progress check: at pcMin minutes after entry, close if the trade has never been pcPts in favour.
+// After it fires the same signal EPISODE is blocked: no entry in that direction until the 30s signal reverses.
+var float mfe = 0.0
+if pos == 0
+    mfe := 0.0
+else if not na(avgP)
+    mfe := math.max(mfe, pos > 0 ? high - avgP : avgP - low)
+pcHit = pcMin > 0 and pos != 0 and strategy.opentrades > 0 and (time - strategy.opentrades.entry_time(0)) >= pcMin * 60000 and mfe < pcPts
+var int pcBlock = 0
+if pcHit
+    pcBlock := pos > 0 ? 1 : -1
+    strategy.close_all(comment = "no progress")
+if pcBlock > 0 and dn30
+    pcBlock := 0
+if pcBlock < 0 and up30
+    pcBlock := 0
+// gate: what the fast systems must show at the moment of a 30s entry
+// COMBINED 2026-09-18: enter only when XAU GroundUp G4 (10s) AND Consolidated F agree on direction; exit when EITHER exits.
+// Deep backtest Aug18-Sep18 last 30 days: +2.95 pct net, 100 pct win, 28 trades, max DD 0.49 pct, no losing trade. F position sizing (about 0.07 lot).
+// ================= FABLE X2: extra pullback triggers feeding the shadow engine (Sep 21 2026) =================
+xW2    = input.float(1.0, "X w stretch (G4 original)", group = "FABLE X2")
+xZ     = input.float(2.2, "X stretch sigma", group = "FABLE X2")
+xW1    = input.float(0.0, "X w sweep-reclaim", group = "FABLE X2")
+xSwN   = input.int(120, "X sweep lookback (10s bars)", group = "FABLE X2")
+xSwM   = input.int(6, "X sweep reclaim max bars", group = "FABLE X2")
+xW3    = input.float(1.0, "X w volume climax", group = "FABLE X2")
+xVLen  = input.int(360, "X volume z length", group = "FABLE X2")
+xVK    = input.float(2.0, "X volume z threshold", group = "FABLE X2")
+xVLb   = input.int(60, "X climax local extreme bars", group = "FABLE X2")
+xW4    = input.float(1.0, "X w vwap band", group = "FABLE X2")
+xBK    = input.float(2.0, "X vwap band sigma", group = "FABLE X2")
+xMem   = input.int(6, "X event memory (10s bars)", group = "FABLE X2")
+xThr   = input.float(1.0, "X score threshold", group = "FABLE X2")
+xRej   = input.int(1, "X need rejection bar 0/1", group = "FABLE X2")
+xVok   = input.int(1, "X need sd band 0/1", group = "FABLE X2")
+xTrend = input.int(1, "X need slow slope 0/1", group = "FABLE X2")
+xStopIn  = input.float(24.0, "X shadow stop pts", group = "FABLE X2")
+xStop = xStopIn * pxScale
+xTgK   = input.float(1.75, "X shadow target sigma mult", group = "FABLE X2")
+xTgMinIn = input.float(2.0, "X shadow target floor pts", group = "FABLE X2")
+xTgMin = xTgMinIn * pxScale
+xSdLoIn  = input.float(1.0, "X sd band low", group = "FABLE X2")
+xSdLo = xSdLoIn * pxScale
+xSdHiIn  = input.float(6.0, "X sd band high", group = "FABLE X2")
+xSdHi = xSdHiIn * pxScale
+xHtf   = input.int(0, "H higher-TF trend 0 off 1 with 2 counter", group = "FABLE X3")
+xHtfTF = input.string("60", "H trend timeframe (min)", group = "FABLE X3")
+xHtfL  = input.int(20, "H trend SMA length", group = "FABLE X3")
+xHtfLb = input.int(3, "H trend slope lookback", group = "FABLE X3")
+xHtfMode = input.int(0, "H mode 0 slope 1 price vs SMA", group = "FABLE X3")
+xVr    = input.int(1, "V volatility ratio gate 0/1", group = "FABLE X3")
+xVrF   = input.int(30, "V fast ATR (10s bars)", group = "FABLE X3")
+xVrS   = input.int(600, "V slow ATR (10s bars)", group = "FABLE X3")
+xVrLo  = input.float(0.5, "V ratio min", group = "FABLE X3")
+xVrHi  = input.float(1.6, "V ratio max", group = "FABLE X3")
+xZMax  = input.float(0.0, "I max stretch sigma (0 off) - ignition guard", group = "FABLE X3")
+xErMax = input.float(0.0, "I max efficiency ratio (0 off)", group = "FABLE X3")
+xErLen = input.int(30, "I efficiency ratio length (10s bars)", group = "FABLE X3")
+xImp   = input.float(0.0, "I max impulse ATR (0 off): |close - close[N]| / ATR", group = "FABLE X3")
+xImpN  = input.int(30, "I impulse lookback N (10s bars)", group = "FABLE X3")
+f_x() =>
+    b  = ta.sma(close, 60)
+    sd = ta.stdev(close, 60)
+    z  = sd > 0 ? (close - b) / sd : 0.0
+    refL = ta.lowest(low, xSwN)[1]
+    refH = ta.highest(high, xSwN)[1]
+    var float lvlL = na
+    var int   ageL = 0
+    var float lvlH = na
+    var int   ageH = 0
+    e1L = false
+    e1S = false
+    if na(lvlL)
+        if low < refL
+            lvlL := refL
+            ageL := 0
+    else
+        ageL += 1
+    if not na(lvlL)
+        if close > lvlL
+            e1L := true
+            lvlL := na
+        else if ageL >= xSwM
+            lvlL := na
+    if na(lvlH)
+        if high > refH
+            lvlH := refH
+            ageH := 0
+    else
+        ageH += 1
+    if not na(lvlH)
+        if close < lvlH
+            e1S := true
+            lvlH := na
+        else if ageH >= xSwM
+            lvlH := na
+    vMa = ta.sma(volume, xVLen)
+    vSd = ta.stdev(volume, xVLen)
+    vz  = vSd > 0 ? (volume - vMa) / vSd : 0.0
+    loB = ta.lowest(low, xVLb)
+    hiB = ta.highest(high, xVLb)
+    mid = (high + low) / 2
+    e3L = vz >= xVK and low <= loB and close > mid
+    e3S = vz >= xVK and high >= hiB and close < mid
+    [vw, vU, vD] = ta.vwap(hlc3, timeframe.change("D"), xBK)
+    e4L = not na(vD) and close <= vD
+    e4S = not na(vU) and close >= vU
+    b1L = ta.barssince(e1L)
+    b1S = ta.barssince(e1S)
+    b3L = ta.barssince(e3L)
+    b3S = ta.barssince(e3S)
+    b4L = ta.barssince(e4L)
+    b4S = ta.barssince(e4S)
+    scL = (z <= -xZ ? xW2 : 0.0) + (not na(b1L) and b1L <= xMem ? xW1 : 0.0) + (not na(b3L) and b3L <= xMem ? xW3 : 0.0) + (not na(b4L) and b4L <= xMem ? xW4 : 0.0)
+    scS = (z >= xZ ? xW2 : 0.0) + (not na(b1S) and b1S <= xMem ? xW1 : 0.0) + (not na(b3S) and b3S <= xMem ? xW3 : 0.0) + (not na(b4S) and b4S <= xMem ? xW4 : 0.0)
+    er = math.sum(math.abs(close - close[1]), xErLen) > 0 ? math.abs(close - close[xErLen]) / math.sum(math.abs(close - close[1]), xErLen) : 0.0
+    imp = ta.atr(60) > 0 ? math.abs(close - close[xImpN]) / ta.atr(60) : 0.0
+    [scL, scS, z, er, imp]
+[xScL, xScS, xZv, xEr, xImpV] = request.security(syminfo.tickerid, "10S", f_x())
+iOk = (xZMax == 0 or math.abs(xZv) <= xZMax) and (xErMax == 0 or xEr <= xErMax) and (xImp == 0 or xImpV <= xImp)
+f_h() =>
+    m = ta.sma(close, xHtfL)
+    up = xHtfMode == 1 ? close > m : m > m[xHtfLb]
+    dn = xHtfMode == 1 ? close < m : m < m[xHtfLb]
+    [up, dn]
+[hUp, hDn] = request.security(syminfo.tickerid, xHtfTF, f_h())
+hOkL = xHtf == 0 or (xHtf == 1 and hUp) or (xHtf == 2 and hDn)
+hOkS = xHtf == 0 or (xHtf == 1 and hDn) or (xHtf == 2 and hUp)
+f_v() =>
+    ta.atr(xVrF) / ta.atr(xVrS)
+vRatio = request.security(syminfo.tickerid, "10S", f_v())
+vOk = xVr == 0 or (vRatio >= xVrLo and vRatio <= xVrHi)
+
+// ================= G4 SHADOW ENGINE (10s) =================
+g4b   = request.security(syminfo.tickerid, "10S", ta.sma(close, 60))
+g4sd  = request.security(syminfo.tickerid, "10S", ta.stdev(close, 60))
+g4c   = request.security(syminfo.tickerid, "10S", close)
+g4o   = request.security(syminfo.tickerid, "10S", open)
+g4h   = request.security(syminfo.tickerid, "10S", high)
+g4lo  = request.security(syminfo.tickerid, "10S", low)
+g4tb  = request.security(syminfo.tickerid, "10S", ta.sma(close, 600))
+g4tbP = request.security(syminfo.tickerid, "10S", ta.sma(close, 600)[60])
+g4z   = g4sd > 0 ? (g4c - g4b) / g4sd : 0.0
+g4up  = g4c > g4o and g4c > (g4h + g4lo) / 2
+g4dn  = g4c < g4o and g4c < (g4h + g4lo) / 2
+g4vok  = xVok == 0 or (g4sd >= xSdLo and g4sd <= xSdHi)
+g4sigL = xScL >= xThr and (xRej == 0 or g4up) and g4vok and (xTrend == 0 or g4tb > g4tbP) and hOkL and vOk and iOk
+g4sigS = xScS >= xThr and (xRej == 0 or g4dn) and g4vok and (xTrend == 0 or g4tb < g4tbP) and hOkS and vOk and iOk
+var int   g4pos = 0
+var float g4ent = na
+var float g4tg  = na
+var float g4frz = 0.0
+var float g4HitTgt = na   // the G4 target price of the last shadow target exit (used by the runner)
+g4Exit = false
+g4Stop = false
+if g4pos > 0
+    if high >= g4ent + g4tg
+        g4Exit := true
+    if low <= g4ent - xStop
+        g4Exit := true
+        g4Stop := true
+if g4pos < 0
+    if low <= g4ent - g4tg
+        g4Exit := true
+    if high >= g4ent + xStop
+        g4Exit := true
+        g4Stop := true
+if g4Exit
+    if not g4Stop
+        g4HitTgt := g4ent + (g4pos > 0 ? g4tg : -g4tg)
+    g4pos := 0
+    if g4Stop
+        g4frz := time + 600000
+if g4pos == 0 and not g4Exit and time >= g4frz
+    if g4sigL
+        g4pos := 1
+        g4ent := g4c
+        g4tg  := math.max(xTgK * g4sd, xTgMin) * g4TgtMult
+    else if g4sigS
+        g4pos := -1
+        g4ent := g4c
+        g4tg  := math.max(xTgK * g4sd, xTgMin) * g4TgtMult
+// ==========================================================
+
+gateL = (mode == M_30 ? true : mode == M_G2 ? (q10 == 1 and q1 == 1) : mode == M_G10 ? q10 == 1 : mode == M_G5 ? q1 == 1 : (q10 == 1 or q1 == 1)) and g4pos > 0
+gateS = (mode == M_30 ? true : mode == M_G2 ? (q10 == -1 and q1 == -1) : mode == M_G10 ? q10 == -1 : mode == M_G5 ? q1 == -1 : (q10 == -1 or q1 == -1)) and g4pos < 0
+
+// ---------------- SIGNAL EPISODE + RE-ENTRY DISCIPLINE ----------------
+// An EPISODE runs from a fresh 30s cross until the opposite cross. The first entry of an
+// episode is free; every later entry must be earned by the chosen re-entry mode.
+var int   epDir   = 0
+var float epPx    = na
+var int   epN     = 0
+var bool  epStop  = false
+var bool  gateBrk = false
+
+if (epDir > 0 and dn30) or (epDir < 0 and up30)
+    epDir   := 0
+    epN     := 0
+    epStop  := false
+    gateBrk := false
+    epPx    := na
+
+// an exit happened while the episode is still live (stop, cap, trail or progress check)
+var int ctPrev = 0
+epExit = epDir != 0 and pos == 0 and (pos[1] != 0 or strategy.closedtrades > ctPrev)
+ctPrev := strategy.closedtrades
+if epExit
+    epStop  := true
+    gateBrk := false
+
+// ---- firm lockout: a closed trade whose loss reached the hard stop starts a timed block ----
+hardUsd = gridN > 0 ? strategy.initial_capital * gridCapPct / 100.0 : slPct > 0.0 ? strategy.initial_capital * slPct / 100.0 : cap30 * qty
+var int   lockTo  = 0
+var int   lockDir = 0
+var int   lossStreak = 0
+var int   lossDir    = 0      // direction of the idea that produced the streak (+1 long / -1 short): step up in THAT direction only
+var float ideaAcc    = 0.0    // net P&L of the current trade idea, all legs (partial + runner)
+var float ideaFull = 0.0    // size of the current trade idea at entry (for partial / runner legs)
+if pos != 0 and (nz(pos[1]) == 0 or math.sign(pos) != math.sign(nz(pos[1])))
+    ideaFull := math.abs(pos)
+ctNow  = strategy.closedtrades
+ctLast = nz(strategy.closedtrades[1], 0)
+if ctNow > 0 and ctNow != ctLast
+    li = ctNow - 1
+    basketPnl = 0.0
+    basketComm = 0.0
+    basketQty = 0.0
+    for k = ctLast to ctNow - 1
+        basketPnl += strategy.closedtrades.profit(k)
+        basketComm += 5.0 * math.abs(strategy.closedtrades.size(k)) / 100.0
+        basketQty += math.abs(strategy.closedtrades.size(k))
+    // MART LAB: the ladder is judged per IDEA when it is fully closed - step up only after a hard-stop size loss
+    // (at least half the hard-stop $), reset after a net win, a small loss keeps the current step
+    ideaAcc += basketPnl
+    if pos == 0 or math.sign(pos) != math.sign(nz(pos[1]))
+        if ideaAcc <= -0.5 * hardUsd
+            lossStreak += 1
+            lossDir := strategy.closedtrades.size(li) > 0 ? 1 : -1
+        else if ideaAcc > 0
+            lossStreak := 0
+        ideaAcc := 0.0
+    // a partial / runner leg is judged against its share of the $ threshold (full closes: unchanged)
+    lockUsdEff = ideaFull > 0 ? lockUsd * math.min(1.0, basketQty / ideaFull) : lockUsd
+    // FundingPips: a same-direction entry within 10 min after ANY losing close joins the same trade idea -> lock out after any net loss
+    if basketPnl - basketComm < 0 or basketPnl < lockUsdEff or basketPnl <= -lockFrac * hardUsd
+        lockTo  := time + lockMin * 60000
+        lockDir := strategy.closedtrades.size(li) > 0 ? 1 : -1
+lockOn  = lockMin > 0 and time < lockTo
+lockL   = lockOn and (lockBoth or lockDir > 0)
+lockS   = lockOn and (lockBoth or lockDir < 0)
+
+epAlign = epDir > 0 ? (q10 == 1 and q1 == 1) : epDir < 0 ? (q10 == -1 and q1 == -1) : false
+if epStop and epDir != 0 and not epAlign
+    gateBrk := true
+epReclaim = not na(epPx) and (epDir > 0 ? close > epPx : epDir < 0 ? close < epPx : false)
+
+reRoom   = reMax == 0 or epN <= reMax
+canCross = epDir == 0 or (epStop and reMode == R_FRSH and reRoom)
+canRe    = epStop and epDir != 0 and reRoom and (reMode == R_GATE ? (gateBrk and epAlign) : reMode == R_PRC ? (epReclaim and epAlign) : reMode == R_BOTH ? (gateBrk and epReclaim and epAlign) : false)
+// ---------------- X3: entry filters, sizing, min hold ----------------
+inS1 = not na(time(timeframe.period, sess1, sessTz))
+inS2 = not na(time(timeframe.period, sess2, sessTz))
+sessOk = (not useSess1 and not useSess2) or (useSess1 and inS1) or (useSess2 and inS2)
+mNY  = hour(time, "America/New_York") * 60 + minute(time, "America/New_York")
+dNY  = dayofweek(time, "America/New_York")
+newsWin = (mNY >= 505 and mNY < 520) or (mNY >= 595 and mNY < 610) or (mNY >= 835 and mNY < 850)
+newsOk = not newsBlock or dNY == dayofweek.saturday or dNY == dayofweek.sunday or not newsWin
+fpDay = dayofmonth(time, "UTC+3")
+bal   = strategy.initial_capital + strategy.netprofit
+var float dayStartBal = strategy.initial_capital
+var int   dayTrades   = 0
+var bool  dayBlock    = false
+if fpDay != nz(fpDay[1], fpDay)
+    dayStartBal := bal
+    dayTrades   := 0
+    dayBlock    := false
+newPos = pos != 0 and (nz(pos[1]) == 0 or math.sign(pos) != math.sign(nz(pos[1])))
+if newPos
+    dayTrades += 1
+if dayLossPct > 0 and bal + strategy.openprofit - dayStartBal <= -strategy.initial_capital * dayLossPct / 100.0
+    dayBlock := true
+if dayProfPct > 0 and bal - dayStartBal >= strategy.initial_capital * dayProfPct / 100.0
+    dayBlock := true
+var int dayLosses = 0
+if fpDay != nz(fpDay[1], fpDay)
+    dayLosses := 0
+if strategy.closedtrades > nz(strategy.closedtrades[1], 0)
+    lossNow = 0.0
+    for k = nz(strategy.closedtrades[1], 0) to strategy.closedtrades - 1
+        lossNow += strategy.closedtrades.profit(k)
+    if lossNow < 0
+        dayLosses += 1
+inNewsWin(tt) => mNY >= tt - newsPre and mNY < tt + newsPost
+newsFlatWin = newsFlat and dNY != dayofweek.saturday and dNY != dayofweek.sunday and (inNewsWin(510) or inNewsWin(600) or inNewsWin(840))
+friNoEntry = friFlat and dNY == dayofweek.friday and mNY >= 16 * 60
+friClose   = friFlat and dNY == dayofweek.friday and mNY >= 16 * 60 + 45
+quietPts = quietPtsIn * pxScale
+rng15 = request.security(syminfo.tickerid, "1", (ta.highest(high, 15) - ta.lowest(low, 15))[1], lookahead = barmerge.lookahead_on)
+quietBlock = quietPts > 0 and not na(rng15) and rng15 < quietPts
+monThu = dNY == dayofweek.monday or dNY == dayofweek.tuesday or dNY == dayofweek.wednesday or dNY == dayofweek.thursday
+breakNoEntry = breakFlat and monThu and mNY >= 16 * 60 + 45 and mNY < 18 * 60
+breakClose   = breakFlat and monThu and mNY >= 16 * 60 + 55 and mNY < 18 * 60
+reopenBlock  = reopenMin > 0 and mNY >= 18 * 60 and mNY < 18 * 60 + reopenMin and (not reopenSun or dNY == dayofweek.sunday)
+entryOk = sessOk and newsOk and not dayBlock and (maxTrDay == 0 or dayTrades < maxTrDay) and not newsFlatWin and not friNoEntry and (maxLossDay == 0 or dayLosses < maxLossDay) and not quietBlock and not breakNoEntry and not reopenBlock
+slipPts = 15 * syminfo.mintick
+stopRef = slPct > 0.0 ? (cap30 > 0.0 ? math.min(cap30, strategy.initial_capital * slPct / 100.0 / qty) : strategy.initial_capital * slPct / 100.0 / qty) : cap30
+float qtyNow = qty
+if riskPct > 0
+    qtyNow := math.max(1.0, math.floor(bal * riskPct / 100.0 / (stopRef + slipPts)))
+float qtyStep = martMult != 1.0 and martMaxK > 0 ? math.floor(qtyNow * math.pow(martMult, math.min(lossStreak, martMaxK))) : qtyNow
+qtyNowL = lossDir > 0 ? qtyStep : qtyNow    // bigger size only when re-entering in the direction of the stopped-out idea
+qtyNowS = lossDir < 0 ? qtyStep : qtyNow
+heldS  = pos != 0 and strategy.opentrades > 0 ? (time - strategy.opentrades.entry_time(0)) / 1000.0 : 0.0
+holdOk = minHoldS <= 0 or heldS >= minHoldS
+var bool exitDue = false      // deferred G4 exit waiting for the min hold (belongs to the CURRENT position)
+flipped = false
+closeL(cm) =>
+    if gridN > 0
+        strategy.close_all(comment = cm)
+    else
+        strategy.close("L", comment = cm)
+closeS(cm) =>
+    if gridN > 0
+        strategy.close_all(comment = cm)
+    else
+        strategy.close("S", comment = cm)
+// V14 entry logic, gMode 1 (veto from flat only), flips allowed while in market; the gate applies to every entry
+if pos > 0
+    if dn30
+        if gateS and entryOk and holdOk
+            strategy.entry("S", strategy.short, qty = qtyNowS)
+            flipped := true
+            exitDue := false
+            epDir := -1
+            epN := 1
+            epStop := false
+            gateBrk := false
+            epPx := close
+        else if holdOk
+            closeL("flip blocked")
+else if pos < 0
+    if up30
+        if gateL and entryOk and holdOk
+            strategy.entry("L", strategy.long, qty = qtyNowL)
+            flipped := true
+            exitDue := false
+            epDir := 1
+            epN := 1
+            epStop := false
+            gateBrk := false
+            epPx := close
+        else if holdOk
+            closeS("flip blocked")
+else
+    if up30 and allowL30 and gateL and pcBlock != 1 and canCross and not lockL and entryOk
+        strategy.entry("L", strategy.long, qty = qtyNowL)
+        epDir := 1
+        epN := epN + 1
+        epStop := false
+        gateBrk := false
+        epPx := na(epPx) ? close : epPx
+    else if dn30 and allowS30 and gateS and pcBlock != -1 and canCross and not lockS and entryOk
+        strategy.entry("S", strategy.short, qty = qtyNowS)
+        epDir := -1
+        epN := epN + 1
+        epStop := false
+        gateBrk := false
+        epPx := na(epPx) ? close : epPx
+    else if canRe and epDir > 0 and allowL30 and pcBlock != 1 and not lockL and entryOk
+        strategy.entry("L", strategy.long, qty = qtyNowL)
+        epN := epN + 1
+        epStop := false
+        gateBrk := false
+    else if canRe and epDir < 0 and allowS30 and pcBlock != -1 and not lockS and entryOk
+        strategy.entry("S", strategy.short, qty = qtyNowS)
+        epN := epN + 1
+        epStop := false
+        gateBrk := false
+// ---- CONFLUENCE WITH A BOUNDED WAIT -----------------------------------
+// F is ACTIVE long/short as a STATE (30s score on its side of the threshold),
+// not just on the one bar it crosses. gateL / gateS already carry F mode
+// confluence AND the G4 shadow agreement. We fire on the bar the PAIR becomes
+// aligned - whichever engine arrives second - but ONLY if the first engine has
+// been waiting no longer than waitMin. 0 = same bar only, 999 = wait forever.
+waitMin = input.int(20, "Confluence max wait between the two signals, minutes (0 = same bar, 999 = unlimited)", minval = 0, maxval = 999, group = G0)
+fStateL = not na(s30) and s30 >= V_THR
+fStateS = not na(s30) and s30 <= (V_TOT - V_THR)
+var float fOnL = na
+var float fOnS = na
+var float gOn  = na
+var int   gPrev = 0
+if fStateL and not fStateL[1]
+    fOnL := time
+if not fStateL
+    fOnL := na
+if fStateS and not fStateS[1]
+    fOnS := time
+if not fStateS
+    fOnS := na
+if g4pos != gPrev
+    if g4pos != 0
+        gOn := time
+    gPrev := g4pos
+pairL = fStateL and gateL
+pairS = fStateS and gateS
+lagL = not na(fOnL) and not na(gOn) ? math.abs(fOnL - gOn) : na
+lagS = not na(fOnS) and not na(gOn) ? math.abs(fOnS - gOn) : na
+okL = waitMin >= 999 or (not na(lagL) and lagL <= waitMin * 60000)
+okS = waitMin >= 999 or (not na(lagS) and lagS <= waitMin * 60000)
+trigL = pairL and not pairL[1] and okL
+trigS = pairS and not pairS[1] and okS
+if strategy.position_size == 0
+    if trigL and allowL30 and not lockL and pcBlock != 1 and entryOk
+        strategy.entry("L", strategy.long, qty = qtyNowL)
+    else if trigS and allowS30 and not lockS and pcBlock != -1 and entryOk
+        strategy.entry("S", strategy.short, qty = qtyNowS)
+// -----------------------------------------------------------------------
+
+
+// V14 exits on latched 30s values: trail + protective stop (Chandelier - pad x ATR) + hard cap folded into the stop
+// hard stop as a % of initial capital: 1% of 25,000 at 20 contracts = 12.5 points
+slPts = slPct > 0.0 ? strategy.initial_capital * slPct / 100.0 / (pos != 0 and ideaFull > 0 ? ideaFull : qtyNow) : na
+capEff = slPct > 0.0 ? (cap30 > 0.0 ? math.min(cap30, slPts) : slPts) : cap30
+capOn = capEff > 0.0 and gridN == 0
+capL = strategy.position_avg_price - capEff
+capS = strategy.position_avg_price + capEff
+stopL0 = gridN > 0 ? na : ls30 - V_PAD * atr30
+stopS0 = gridN > 0 ? na : ss30 + V_PAD * atr30
+stopL1 = capOn ? math.max(stopL0, capL) : stopL0
+stopS1 = capOn ? math.min(stopS0, capS) : stopS0
+// break-even: once price has been bePts in profit, the stop is floored at entry (+ lockP)
+var bool beArmed = false
+if pos == 0
+    beArmed := false
+if bePts > 0 and pos != 0 and not na(avgP) and (beAfterS <= 0 or heldS >= beAfterS)
+    if (pos > 0 and high >= avgP + bePts) or (pos < 0 and low <= avgP - bePts)
+        beArmed := true
+stopL = beArmed and pos > 0 ? math.max(nz(stopL1, avgP + lockP), avgP + lockP) : stopL1
+stopS = beArmed and pos < 0 ? math.min(nz(stopS1, avgP - lockP), avgP - lockP) : stopS1
+g4LimL = g4Limit and g4pos > 0 and holdOk ? g4ent + g4tg : na
+g4LimS = g4Limit and g4pos < 0 and holdOk ? g4ent - g4tg : na
+// ---- X3 5s runner: take (100 - runPct)% at the G4 target, the rest runs with its stop locked beyond entry.
+// From the next bar the locked stop means the runner cannot turn the trade idea into a loss (FundingPips 1% rule unchanged).
+runLock = runLockIn * pxScale
+var bool  runOn     = false
+var float runFull   = 0.0
+var int   runT0     = 0
+var float runTpDist = na
+if pos == 0 or newPos
+    runOn := false
+if newPos
+    runFull := math.abs(pos)
+runStray = false
+if runPct > 0 and gridN == 0 and pos != 0 and not runOn and not newPos and math.abs(pos) < runFull
+    lastXp = strategy.closedtrades > 0 ? strategy.closedtrades.exit_price(strategy.closedtrades - 1) : na
+    okLeg  = not na(lastXp) and (pos > 0 ? lastXp >= avgP + runLock + slipPts : lastXp <= avgP - runLock - slipPts)
+    if okLeg
+        runOn := true
+        runT0 := time
+        runTpDist := math.abs(nz(g4HitTgt, g4ent + (pos > 0 ? g4tg : -g4tg)) - avgP)
+    else
+        runStray := true      // the size was cut by a stop / trail, not by the target: close the rest like the full position would have
+        strategy.close_all(comment = "rest")
+runOkL  = runNeed == "Always" or (runNeed == "30s trend" ? fStateL : fStateL and q10 == 1 and q1 == 1)
+runOkS  = runNeed == "Always" or (runNeed == "30s trend" ? fStateS : fStateS and q10 == -1 and q1 == -1)
+runArmL = runPct > 0 and gridN == 0 and pos > 0 and not runOn and not runStray and runOkL and not na(g4ent) and g4ent + g4tg - avgP > runLock + slipPts
+runArmS = runPct > 0 and gridN == 0 and pos < 0 and not runOn and not runStray and runOkS and not na(g4ent) and avgP - (g4ent - g4tg) > runLock + slipPts
+tpQty   = math.max(1.0, math.round(runFull * (100 - runPct) / 100.0))
+if runOn and pos > 0
+    stopL := na(stopL) ? avgP + runLock : math.max(stopL, avgP + runLock)
+if runOn and pos < 0
+    stopS := na(stopS) ? avgP - runLock : math.min(stopS, avgP - runLock)
+runLimL = runOn and runTgtX > 0 and not na(runTpDist) ? avgP + runTgtX * runTpDist : na
+runLimS = runOn and runTgtX > 0 and not na(runTpDist) ? avgP - runTgtX * runTpDist : na
+limL = runOn ? runLimL : runArmL ? na : g4LimL
+limS = runOn ? runLimS : runArmS ? na : g4LimS
+// while the target part is pending, the protective exit covers only the runner part so the two exits share the position
+tArmL = runArmL and not na(g4LimL) and not exitDue
+tArmS = runArmS and not na(g4LimS) and not exitDue
+xQtyL = tArmL ? runFull - tpQty : na
+xQtyS = tArmS ? runFull - tpQty : na
+// the target leg gets the same "no stop above / below the market" rule as the protective exit
+tStopL = not na(stopL) and stopL < close ? stopL : na
+tStopS = not na(stopS) and stopS > close ? stopS : na
+runTrail = runOn and runTrlX > 0
+trPts = runTrail ? na : V_ACT * atr30 / tk
+trPx  = runTrail ? avgP : na
+trOff = runTrail ? runTrlX * atr30 / tk : V_TRL * atr30 / tk
+nLegs  = strategy.opentrades
+gridTpMode = gridN > 0 and nLegs > 1 and gridTp > 0
+if gridN == 0
+    if pos > 0 and not na(atr30) and not pcHit
+        if tArmL
+            strategy.exit("tL", "L", qty = tpQty, stop = tStopL, limit = g4LimL, trail_points = V_ACT * atr30 / tk, trail_offset = V_TRL * atr30 / tk)
+        else
+            strategy.cancel("tL")
+        if capOn and close <= capL
+            strategy.close("L", comment = "cap")
+        else if runOn and not na(stopL) and stopL >= close
+            strategy.close("L", comment = "runner stop")
+        else if not na(stopL) and stopL < close
+            strategy.exit("xL", "L", qty = xQtyL, stop = stopL, limit = limL, trail_price = trPx, trail_points = trPts, trail_offset = trOff)
+        else if beArmed and not na(stopL) and stopL >= close
+            strategy.close("L", comment = "be")
+        else
+            strategy.exit("xL", "L", qty = xQtyL, limit = limL, trail_price = trPx, trail_points = trPts, trail_offset = trOff)
+    if pos < 0 and not na(atr30) and not pcHit
+        if tArmS
+            strategy.exit("tS", "S", qty = tpQty, stop = tStopS, limit = g4LimS, trail_points = V_ACT * atr30 / tk, trail_offset = V_TRL * atr30 / tk)
+        else
+            strategy.cancel("tS")
+        if capOn and close >= capS
+            strategy.close("S", comment = "cap")
+        else if runOn and not na(stopS) and stopS <= close
+            strategy.close("S", comment = "runner stop")
+        else if not na(stopS) and stopS > close
+            strategy.exit("xS", "S", qty = xQtyS, stop = stopS, limit = limS, trail_price = trPx, trail_points = trPts, trail_offset = trOff)
+        else if beArmed and not na(stopS) and stopS <= close
+            strategy.close("S", comment = "be")
+        else
+            strategy.exit("xS", "S", qty = xQtyS, limit = limS, trail_price = trPx, trail_points = trPts, trail_offset = trOff)
+else
+    // ---- grid basket: resting limit legs, one combined hard stop, optional basket take-profit
+    if pos == 0
+        for k = 1 to 5
+            strategy.cancel("GL" + str.tostring(k))
+            strategy.cancel("GS" + str.tostring(k))
+    else
+        dG = pos > 0 ? 1 : -1
+        anchor = strategy.opentrades.entry_price(0)
+        legQ = math.abs(strategy.opentrades.size(0))
+        filled = nLegs - 1
+        if filled < gridN
+            for k = filled + 1 to gridN
+                lvl = anchor - dG * gridStep * k
+                strategy.order((dG > 0 ? "GL" : "GS") + str.tostring(k), dG > 0 ? strategy.long : strategy.short, qty = math.floor(legQ * math.pow(gridMult, k)), limit = lvl)
+        capX = avgP - dG * (strategy.initial_capital * gridCapPct / 100.0) / math.abs(pos)
+        tpX  = gridTpMode ? avgP + dG * gridTp : (dG > 0 ? g4LimL : g4LimS)
+        if not na(atr30) and nLegs == 1
+            strategy.exit("xB", stop = capX, limit = tpX, trail_points = V_ACT * atr30 / tk, trail_offset = V_TRL * atr30 / tk)
+        else
+            strategy.exit("xB", stop = capX, limit = tpX)
+
+if strategy.position_size == 0
+    exitDue := false
+runArm = (pos > 0 and runArmL) or (pos < 0 and runArmS)
+if g4Exit and strategy.position_size != 0 and not gridTpMode and not flipped
+    if runOn and not g4Stop
+        exitDue := false        // the runner is managed by its locked stop / trail / target / 30s flip / time
+    else if holdOk
+        if runArm and not g4Stop
+            strategy.close(pos > 0 ? "L" : "S", qty = tpQty, comment = "G4 partial")
+        else
+            strategy.close_all(comment = "G4 exit")
+    else
+        exitDue := true
+else if exitDue and strategy.position_size != 0 and holdOk and not gridTpMode and not flipped
+    if not runOn
+        if runArm
+            strategy.close(pos > 0 ? "L" : "S", qty = tpQty, comment = "G4 partial (min hold)")
+        else
+            strategy.close_all(comment = "G4 exit (min hold)")
+    exitDue := false
+if runOn and runMaxMin > 0 and strategy.position_size != 0 and not flipped and time - runT0 >= runMaxMin * 60000
+    strategy.close_all(comment = "runner time")
+if strategy.position_size != 0
+    if maxHoldMin > 0 and heldS >= maxHoldMin * 60
+        strategy.close_all(comment = "max hold")
+    else if newsFlatWin
+        strategy.close_all(comment = "news flat")
+    else if friClose
+        strategy.close_all(comment = "weekend flat")
+    else if breakClose
+        strategy.close_all(comment = "daily-break flat")
+
+// ============================ DISPLAY ============================
+plotshape(up30 and pos <= 0 and allowL30 and gateL,  "Long",  shape.triangleup,   location.belowbar, color.new(color.teal, 0), size = size.small)
+plotshape(dn30 and pos >= 0 and allowS30 and gateS,  "Short", shape.triangledown, location.abovebar, color.new(color.red, 0),  size = size.small)
+plotshape(up30 and pos <= 0 and allowL30 and not gateL, "Long blocked by gate",  shape.xcross, location.belowbar, color.new(color.gray, 0), size = size.tiny)
+plotshape(dn30 and pos >= 0 and allowS30 and not gateS, "Short blocked by gate", shape.xcross, location.abovebar, color.new(color.gray, 0), size = size.tiny)
+bgcolor(q10 == 1 and q1 == 1 ? color.new(color.teal, 94) : q10 == -1 and q1 == -1 ? color.new(color.red, 94) : na, title = "10s+5s agreement")
+plot(q10, "10s position", display = display.data_window)
+plot(q1,  "5s position",  display = display.data_window)
+plot(s30, "30s score",    display = display.data_window)
+plot(pos > 0 ? stopL : pos < 0 ? stopS : na, "Protective stop", color.new(color.orange, 0), 1, plot.style_linebr)
+
+// ================= FABLE X2 STATUS PANEL (compact, mobile) =================
+dashOn  = input.bool(true, "Status panel", group = "STATUS PANEL")
+dashPos = input.string("Top right", "Panel position", options = ["Top right", "Top left", "Bottom right", "Bottom left"], group = "STATUS PANEL")
+dashSz  = input.string("Small", "Panel text size", options = ["Tiny", "Small", "Normal", "Large"], group = "STATUS PANEL")
+var table dash = na
+if dashOn and barstate.islast
+    tp = dashPos == "Top right" ? position.top_right : dashPos == "Top left" ? position.top_left : dashPos == "Bottom right" ? position.bottom_right : position.bottom_left
+    ts = dashSz == "Large" ? size.large : dashSz == "Normal" ? size.normal : dashSz == "Small" ? size.small : size.tiny
+    if na(dash)
+        dash := table.new(tp, 1, 6, bgcolor = color.new(color.black, 25), border_width = 1, border_color = color.new(color.gray, 60))
+    inL = pos > 0
+    inS = pos < 0
+    hdrCol = inL ? color.new(color.teal, 0) : inS ? color.new(color.red, 0) : color.new(color.gray, 40)
+    upl = strategy.openprofit
+    etime = strategy.opentrades > 0 ? strategy.opentrades.entry_time(strategy.opentrades - 1) : na
+    mins = na(etime) ? na : (time - etime) / 60000.0
+    stopPx = inL ? stopL : inS ? stopS : na
+    tgtPx  = g4pos > 0 ? g4ent + g4tg : g4pos < 0 ? g4ent - g4tg : na
+    // row 0: state
+    r0 = inL ? "LONG " + str.tostring(math.abs(pos), "#") + "oz @" + str.tostring(avgP, "#.##") : inS ? "SHORT " + str.tostring(math.abs(pos), "#") + "oz @" + str.tostring(avgP, "#.##") : "FLAT  " + str.tostring(close, "#.##")
+    table.cell(dash, 0, 0, r0, text_color = color.white, bgcolor = hdrCol, text_size = ts, text_halign = text.align_left)
+    // row 1: P/L + stop + target
+    r1 = pos != 0 ? "P/L " + str.tostring(upl, "#") + "$ (" + str.tostring(inL ? close - avgP : avgP - close, "#.#") + "p)  " + str.tostring(mins, "#") + "m\nSL " + (na(stopPx) ? "-" : str.tostring(stopPx, "#.##")) + "  TP " + (na(tgtPx) ? "-" : str.tostring(tgtPx, "#.##")) : "no position"
+    table.cell(dash, 0, 1, r1, text_color = pos == 0 ? color.gray : upl >= 0 ? color.new(color.lime, 0) : color.new(color.orange, 0), text_size = ts, text_halign = text.align_left)
+    // row 2: gates
+    gv = (fStateL ? "L" : fStateS ? "S" : "-") + "/" + (q10 == 1 ? "L" : q10 == -1 ? "S" : "-") + "/" + (q1 == 1 ? "L" : q1 == -1 ? "S" : "-")
+    g4t = g4pos > 0 ? "G4:L" : g4pos < 0 ? "G4:S" : "G4:-"
+    vt = xVr == 0 ? "" : (vOk ? "  vol OK " : "  vol BLK ") + str.tostring(vRatio, "#.#") + "x"
+    table.cell(dash, 0, 2, "30s/10s/5s " + gv + "  " + g4t + vt, text_color = xVr == 1 and not vOk ? color.new(color.orange, 0) : color.new(color.silver, 0), text_size = ts, text_halign = text.align_left)
+    // row 3: last trade
+    nC = strategy.closedtrades
+    lastIdx = nC - 1
+    lPnl = nC > 0 ? strategy.closedtrades.profit(lastIdx) : na
+    lSz  = nC > 0 ? strategy.closedtrades.size(lastIdx) : na
+    lXt  = nC > 0 ? strategy.closedtrades.exit_time(lastIdx) : na
+    lCm  = nC > 0 ? strategy.closedtrades.exit_comment(lastIdx) : ""
+    lWhy = lCm == "G4 exit" ? "target" : lCm == "xL" or lCm == "xS" ? "stop" : lCm
+    lAgo = na(lXt) ? na : (time - lXt) / 60000.0
+    lAgoT = na(lAgo) ? "" : lAgo < 90 ? str.tostring(lAgo, "#") + "m ago" : lAgo < 2880 ? str.tostring(lAgo / 60, "#.#") + "h ago" : str.tostring(lAgo / 1440, "#") + "d ago"
+    lWin = not na(lPnl) and lPnl > 0
+    r3 = nC > 0 ? "Last: " + (lSz > 0 ? "L " : "S ") + (lWin ? "WIN +" : "LOSS ") + str.tostring(lPnl, "#") + "$ " + lWhy + " " + lAgoT : "Last: none"
+    table.cell(dash, 0, 3, r3, text_color = nC == 0 ? color.gray : lWin ? color.new(color.lime, 0) : color.new(color.orange, 0), text_size = ts, text_halign = text.align_left)
+    // row 4: today + last 5
+    dayPnl = 0.0
+    dayN = 0
+    dayW = 0
+    last5 = ""
+    d0 = timestamp("UTC", year(time, "UTC"), month(time, "UTC"), dayofmonth(time, "UTC"), 0, 0)
+    if nC > 0
+        for k = nC - 1 to math.max(0, nC - 40)
+            p = strategy.closedtrades.profit(k)
+            if strategy.closedtrades.exit_time(k) >= d0
+                dayPnl += p
+                dayN += 1
+                dayW += p > 0 ? 1 : 0
+            if nC - 1 - k < 5
+                last5 := (p > 0 ? "W" : "L") + last5
+    r4 = "Today " + (dayN > 0 ? str.tostring(dayPnl, "#") + "$ " + str.tostring(dayW) + "W/" + str.tostring(dayN - dayW) + "L" : "0") + "   last5 " + (nC > 0 ? last5 : "-")
+    table.cell(dash, 0, 4, r4, text_color = dayPnl > 0 ? color.new(color.lime, 0) : dayPnl < 0 ? color.new(color.orange, 0) : color.new(color.silver, 0), text_size = ts, text_halign = text.align_left)
+    table.cell(dash, 0, 5, "FABLE X3 5s  hold " + str.tostring(minHoldS) + "s  risk " + str.tostring(slPct) + "%", text_color = color.gray, text_size = size.tiny, text_halign = text.align_left)
+plot(vRatio, "vol ratio", display = display.data_window)
+plot(hUp ? 1 : hDn ? -1 : 0, "HTF trend", display = display.data_window)
+plot(xZv, "stretch z", display = display.data_window)
+plot(xEr, "ER", display = display.data_window)
+plot(xImpV, "impulse ATR", display = display.data_window)

@@ -1,0 +1,60 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  tvbridge ngrok tunnel LaunchAgent template.
+  install.sh renders this file into ~/Library/LaunchAgents/com.tvbridge.ngrok.plist
+  once ngrok.authtoken and ngrok.domain are set in config.json. The tunnel forwards
+  https://<your ngrok domain> to the local webhook listener on 127.0.0.1 only.
+  The authtoken is not stored here; it lives in ngrok.yml (chmod 600), written by
+  "python -m tvbridge ngrok-config".
+  inspect=false: the agent must not keep webhook bodies (they carry the secret) on its
+  local inspection API (127.0.0.1:4040), where other local users/processes could read or
+  replay them. The /api/tunnels status endpoint used by `tvbridge doctor` keeps working.
+-->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.tvbridge.ngrok</string>
+
+	<key>ProgramArguments</key>
+	<array>
+		<string>__NGROK__</string>
+		<string>http</string>
+		<string>127.0.0.1:__PORT__</string>
+		<string>--url</string>
+		<string>https://__DOMAIN__</string>
+		<string>--config</string>
+		<string>__TVBRIDGE_HOME__/ngrok.yml</string>
+		<string>--log</string>
+		<string>stdout</string>
+		<string>--inspect=false</string>
+	</array>
+
+	<key>WorkingDirectory</key>
+	<string>__TVBRIDGE_HOME__</string>
+
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>TVBRIDGE_HOME</key>
+		<string>__TVBRIDGE_HOME__</string>
+		<key>PATH</key>
+		<string>/usr/bin:/bin:/usr/sbin:/sbin</string>
+	</dict>
+
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<true/>
+	<key>ThrottleInterval</key>
+	<integer>10</integer>
+	<key>ProcessType</key>
+	<string>Interactive</string>
+	<key>LimitLoadToSessionType</key>
+	<string>Aqua</string>
+
+	<key>StandardOutPath</key>
+	<string>__LOGDIR__/ngrok.log</string>
+	<key>StandardErrorPath</key>
+	<string>__LOGDIR__/ngrok.stderr.log</string>
+</dict>
+</plist>

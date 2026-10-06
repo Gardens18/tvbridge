@@ -1,0 +1,105 @@
+//@version=6
+// =============================================================================
+// tvbridge example strategy: PLUMBING EXAMPLE ONLY
+//
+// This is NOT a trading recommendation and NOT a strategy to trade. The entry
+// rule below (a moving-average cross) is a placeholder. It only exists to show
+// how to wire a Pine strategy to tvbridge: every order call carries an
+// alert_message with the JSON that tvbridge needs (action, sl, tp, quote_usd).
+// Replace the placeholder signal with YOUR OWN logic. Hantec's rules require the
+// strategy to be your own; third-party strategies used to pass the challenge
+// are prohibited.
+//
+// Position size: the strategy's quantity settings only affect TradingView's
+// backtest. tvbridge sizes every order itself from the stop-loss distance and
+// its risk settings (risk.risk_per_trade_pct, etc.).
+//
+// Alert setup (see tradingview/ALERTS.md):
+//   Condition:   this strategy, "Order fills only"
+//   Webhook URL: https://<your-ngrok-domain>/webhook
+//   Message (paste your secret in the dialog, not in this script):
+//   {"secret":"PASTE_YOUR_SECRET","time":"{{timenow}}","symbol":"{{ticker}}","price":{{close}},"order":{{strategy.order.alert_message}}}
+// After editing this script or its inputs, delete the alert and create it again.
+// =============================================================================
+strategy("tvbridge plumbing example (not a strategy)", overlay = true, initial_capital = 50000, default_qty_type = strategy.percent_of_equity, default_qty_value = 10, pyramiding = 0, calc_on_every_tick = false, process_orders_on_close = false)
+
+// ----------------------------------------------------------------------------- inputs
+grpSig = "Placeholder signal (replace with your own logic)"
+fastLen = input.int(20, "Fast SMA length", minval = 1, group = grpSig)
+slowLen = input.int(50, "Slow SMA length", minval = 2, group = grpSig)
+
+grpRisk = "Stop-loss / take-profit"
+atrLen = input.int(14, "ATR length", minval = 1, group = grpRisk)
+slAtr = input.float(1.5, "Stop-loss distance = ATR x", minval = 0.1, step = 0.1, group = grpRisk)
+tpAtr = input.float(3.0, "Take-profit distance = ATR x (0 = no TP)", minval = 0.0, step = 0.1, group = grpRisk)
+
+grpTvb = "tvbridge"
+allowShorts = input.bool(true, "Allow short entries", group = grpTvb)
+riskPct = input.float(0.0, "risk_pct override (0 = use tvbridge config)", minval = 0.0, maxval = 1.0, step = 0.05, group = grpTvb)
+stratName = input.string("tvb-example", "Strategy label sent to tvbridge (no quotes or backslashes)", group = grpTvb)
+
+// ----------------------------------------------------------------------------- placeholder signal
+atr = ta.atr(atrLen)
+fast = ta.sma(close, fastLen)
+slow = ta.sma(close, slowLen)
+longSignal = ta.crossover(fast, slow)
+shortSignal = ta.crossunder(fast, slow)
+ready = not na(atr) and not na(slow)
+
+// USD value of one unit of the quote currency: 1.0 for EURUSD, the JPY->USD rate
+// for USDJPY, the GBP->USD rate for EURGBP. tvbridge needs it for crosses whose
+// quote currency is not USD; sending it always is harmless.
+quoteUsd = request.currency_rate(syminfo.currency, "USD")
+
+// ----------------------------------------------------------------------------- alert_message JSON
+// A price as a JSON number rounded to the symbol's tick size, e.g. 1.08255.
+fmtPrice(float x) =>
+    str.tostring(x, format.mintick)
+
+// Entry: {"action":"buy|sell","sl":...,"tp":...,"quote_usd":...,"strategy":"..."}
+// "sl" is mandatory for tvbridge; "tp" and "risk_pct" are optional.
+entryJson(string action, float sl, float tp) =>
+    string msg = '{"action":"' + action + '","sl":' + fmtPrice(sl)
+    if tpAtr > 0 and not na(tp)
+        msg += ',"tp":' + fmtPrice(tp)
+    if not na(quoteUsd)
+        msg += ',"quote_usd":' + str.tostring(quoteUsd, "#.##########")
+    if riskPct > 0
+        msg += ',"risk_pct":' + str.tostring(riskPct)
+    msg += ',"strategy":"' + stratName + '"}'
+    msg
+
+// Exit: {"action":"close","side":"buy|sell",...} closes this symbol's positions on that side.
+exitJson(string side) =>
+    '{"action":"close","side":"' + side + '","strategy":"' + stratName + '"}'
+
+// ----------------------------------------------------------------------------- orders
+isFlat = strategy.position_size == 0
+isLong = strategy.position_size > 0
+isShort = strategy.position_size < 0
+
+// Exit on the opposite cross.
+if isLong and shortSignal
+    strategy.close("Long", comment = "Long exit", alert_message = exitJson("buy"))
+if isShort and longSignal
+    strategy.close("Short", comment = "Short exit", alert_message = exitJson("sell"))
+
+// Entries only from flat, so every fill maps to exactly one tvbridge action.
+// The same stop/target levels go to tvbridge (as the MT5 server-side SL/TP) and
+// to strategy.exit (so the backtest matches). When MT5's stop fills first, the
+// later "close" alert simply finds nothing to close (NO_POSITION).
+if isFlat and ready and longSignal
+    float longSL = close - slAtr * atr
+    float longTP = close + tpAtr * atr
+    strategy.entry("Long", strategy.long, alert_message = entryJson("buy", longSL, longTP))
+    strategy.exit("Long SL/TP", from_entry = "Long", stop = longSL, limit = tpAtr > 0 ? longTP : na, alert_message = exitJson("buy"))
+
+if isFlat and ready and shortSignal and allowShorts
+    float shortSL = close + slAtr * atr
+    float shortTP = close - tpAtr * atr
+    strategy.entry("Short", strategy.short, alert_message = entryJson("sell", shortSL, shortTP))
+    strategy.exit("Short SL/TP", from_entry = "Short", stop = shortSL, limit = tpAtr > 0 ? shortTP : na, alert_message = exitJson("sell"))
+
+// ----------------------------------------------------------------------------- plots
+plot(fast, "Fast SMA", color = color.new(color.blue, 0))
+plot(slow, "Slow SMA", color = color.new(color.orange, 0))

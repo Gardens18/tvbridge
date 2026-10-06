@@ -1,0 +1,220 @@
+{
+  "_comment": "tvbridge configuration. Copy to $TVBRIDGE_HOME/config.json (default ~/.tvbridge/config.json) with 'python -m tvbridge init', which also generates server.secret. Keys starting with '_' are comments and are ignored; any other unknown key is an error. Omitted keys fall back to built-in defaults.",
+  "server": {
+    "_comment": "Webhook listener. Bind to 127.0.0.1 and expose it with ngrok. secret must be a random string >= 16 chars and must match the 'secret' field of every TradingView alert. The placeholder below is rejected on purpose: run 'python -m tvbridge init'. tradingview_ips is TradingView's published webhook source list (checked against X-Forwarded-For from ngrok).",
+    "host": "127.0.0.1",
+    "port": 8787,
+    "path": "/webhook",
+    "secret": "CHANGE_ME_run_tvbridge_init",
+    "enforce_ip_allowlist": true,
+    "tradingview_ips": [
+      "52.89.214.238",
+      "34.212.75.30",
+      "54.218.53.128",
+      "52.32.178.7"
+    ],
+    "allow_local_requests": true,
+    "max_body_bytes": 8192,
+    "max_signal_age_s": 120,
+    "max_future_skew_s": 30,
+    "rate_limit_per_min": 30,
+    "forward_to": []
+  },
+  "account": {
+    "_comment": "Prop account. server_utc_offset_hours is the MT5 server clock offset in hours (Hantec: GMT+3; GMT+2 in northern winter if the broker shifts DST -- check the Market Watch clock), or \"auto\" for UTC+3 while US daylight saving time is in effect and UTC+2 otherwise (brokers whose day ends at the New York close; switches e.g. on 1 Nov 2026). account_login / server_name, if set, must appear in the MT5 main window title (guards against trading the wrong account).",
+    "name": "Hantec Endurance 50k",
+    "initial_balance": 50000.0,
+    "currency": "USD",
+    "server_utc_offset_hours": 3.0,
+    "account_login": "",
+    "server_name": ""
+  },
+  "risk": {
+    "_comment": "All percentages are of balance unless stated. Firm limits: daily_loss_pct (from the day's reference = max(balance, equity) at 00:00 server time) and max_loss_pct (static, from initial_balance). *_buffer_pct keep entries away from those limits; kill_buffer_pct triggers an emergency flatten. Times are server time HH:MM; trading_days_server uses Mon=0..Sun=6; friday_cutoff_server null disables it.",
+    "daily_loss_pct": 4.0,
+    "max_loss_pct": 8.0,
+    "daily_buffer_pct": 1.0,
+    "max_buffer_pct": 1.0,
+    "kill_buffer_pct": 0.3,
+    "risk_per_trade_pct": 0.5,
+    "max_risk_per_trade_pct": 1.0,
+    "max_total_open_risk_pct": 2.0,
+    "max_open_positions": 3,
+    "max_trades_per_day": 8,
+    "max_lots": 5.0,
+    "commission_per_lot_usd": 5.0,
+    "slippage_buffer_pct": 15.0,
+    "equity_max_age_s": 90,
+    "entry_max_delay_s": 45,
+    "reverse_on_opposite": true,
+    "allow_pyramiding": false,
+    "block_untracked_positions": true,
+    "trading_start_server": "00:05",
+    "trading_end_server": "23:50",
+    "trading_days_server": [
+      0,
+      1,
+      2,
+      3,
+      4
+    ],
+    "friday_cutoff_server": "22:00",
+    "min_hold_s_for_signal_close": 0,
+    "resume_after_verified_fill": false
+  },
+  "symbols": {
+    "_comment": "Symbols are keyed by normalized TradingView symbol (OANDA:EURUSD, EUR/USD and EURUSD.h all become EURUSD). The MT5 name is map[symbol] if present, else symbol + suffix. allowed: empty list = every symbol in specs. commission_per_lot_usd in a spec (null = risk.commission_per_lot_usd) is the round-trip commission per 1.00 lot of that symbol.",
+    "suffix": ".h",
+    "map": {},
+    "allowed": [],
+    "specs": {
+      "_comment": "IMPORTANT: contract_size, digits, point, lot_step and min_lot MUST be checked against Hantec's product specification table (and the MT5 'Specification' window for each symbol) before going live -- position sizing depends on them. contract_size is units per 1.0 lot; quote is the quote currency; min_sl_points is the minimum stop distance in points. Set a symbol to null to remove a default.",
+      "EURUSD": {
+        "contract_size": 100000.0,
+        "quote": "USD",
+        "digits": 5,
+        "point": 1e-05,
+        "lot_step": 0.01,
+        "min_lot": 0.01,
+        "min_sl_points": 50,
+        "commission_per_lot_usd": null
+      },
+      "GBPUSD": {
+        "contract_size": 100000.0,
+        "quote": "USD",
+        "digits": 5,
+        "point": 1e-05,
+        "lot_step": 0.01,
+        "min_lot": 0.01,
+        "min_sl_points": 50,
+        "commission_per_lot_usd": null
+      },
+      "AUDUSD": {
+        "contract_size": 100000.0,
+        "quote": "USD",
+        "digits": 5,
+        "point": 1e-05,
+        "lot_step": 0.01,
+        "min_lot": 0.01,
+        "min_sl_points": 50,
+        "commission_per_lot_usd": null
+      },
+      "NZDUSD": {
+        "contract_size": 100000.0,
+        "quote": "USD",
+        "digits": 5,
+        "point": 1e-05,
+        "lot_step": 0.01,
+        "min_lot": 0.01,
+        "min_sl_points": 50,
+        "commission_per_lot_usd": null
+      },
+      "USDJPY": {
+        "contract_size": 100000.0,
+        "quote": "JPY",
+        "digits": 3,
+        "point": 0.001,
+        "lot_step": 0.01,
+        "min_lot": 0.01,
+        "min_sl_points": 50,
+        "commission_per_lot_usd": null
+      },
+      "USDCAD": {
+        "contract_size": 100000.0,
+        "quote": "CAD",
+        "digits": 5,
+        "point": 1e-05,
+        "lot_step": 0.01,
+        "min_lot": 0.01,
+        "min_sl_points": 50,
+        "commission_per_lot_usd": null
+      },
+      "USDCHF": {
+        "contract_size": 100000.0,
+        "quote": "CHF",
+        "digits": 5,
+        "point": 1e-05,
+        "lot_step": 0.01,
+        "min_lot": 0.01,
+        "min_sl_points": 50,
+        "commission_per_lot_usd": null
+      },
+      "XAUUSD": {
+        "contract_size": 100.0,
+        "quote": "USD",
+        "digits": 2,
+        "point": 0.01,
+        "lot_step": 0.01,
+        "min_lot": 0.01,
+        "min_sl_points": 100,
+        "commission_per_lot_usd": null
+      }
+    }
+  },
+  "executor": {
+    "_comment": "mode: 'paper' (simulated, default), 'rehearsal' (drives MT5 but presses Escape instead of Buy/Sell) or 'live'. Always rehearse on a DEMO account first. gui holds MT5 window matching and timing for the GUI executor.",
+    "mode": "paper",
+    "paper_start_balance": null,
+    "gui": {
+      "owner_names": [
+        "MetaTrader 5",
+        "terminal64",
+        "wine64-preloader",
+        "wine-preloader",
+        "wine"
+      ],
+      "main_title_contains": "",
+      "order_dialog_title_contains": [
+        "Order"
+      ],
+      "position_dialog_title_contains": [
+        "Position",
+        "Order"
+      ],
+      "require_dialog_text": [
+        "Market"
+      ],
+      "dialog_timeout_s": 4.0,
+      "result_timeout_s": 8.0,
+      "action_delay_s": 0.15,
+      "size_tolerance_px": 12,
+      "ocr_min_confidence": 0.3,
+      "account_poll_s": 15,
+      "keep_screenshots_days": 14,
+      "volume_field_offset_px": 85,
+      "lock_path": "",
+      "lock_timeout_s": 30.0,
+      "open_order_via": "f9"
+    }
+  },
+  "mirror": {
+    "_comment": "Mirror mode (action 'sync', see README 'Mirror mode' and tradingview/ALERTS.md). One TradingView strategy alert on every order fill reports the strategy's position; tvbridge makes the MT5 position on that symbol match it. units_per_lot: strategy units per 1.00 MT5 lot (gold: 100 oz). stop_distance: broker-side protective stop in price units, measured from the MT5 ticket's own quote (a safety net; normal exits come from alerts). tp_distance 0 = no take-profit. size_tolerance_lots: differences up to this count as in sync. max_price_gap_pct: an entry is refused when the alert price and the MT5 quote differ by more. allow_adds false: never add to an open position. fan_out: mirror one alert symbol onto several MT5 symbols, each as its own position with the full strategy size, e.g. {\"XAUUSD\": [\"XAUUSD\", \"XAUUSDMICRO\"]} (every target needs a symbols.specs entry; see README 'Mirror fan-out'). units_per_lot_by_symbol: per-symbol override of units_per_lot, e.g. {\"XAUUSDMICRO\": 10} for a 10 oz micro lot. stop_distance_by_symbol / tp_distance_by_symbol: per-symbol overrides of stop_distance / tp_distance, e.g. {\"XAGUSD\": 1.4}.",
+    "enabled": false,
+    "units_per_lot": 100.0,
+    "stop_distance": 8.5,
+    "tp_distance": 0.0,
+    "size_tolerance_lots": 0.005,
+    "max_price_gap_pct": 0.5,
+    "allow_adds": false,
+    "idea_risk_pct": 0.0,
+    "fan_out": {},
+    "units_per_lot_by_symbol": {},
+    "stop_distance_by_symbol": {},
+    "tp_distance_by_symbol": {},
+    "quote_usd_by_symbol": {},
+    "max_price_gap_pct_by_symbol": {}
+  },
+  "notify": {
+    "_comment": "Notification channels. macos uses Notification Center; ntfy_url e.g. https://ntfy.sh/<your-topic>; Telegram needs both bot token and chat id. min_level: debug | info | warn | critical.",
+    "macos": true,
+    "ntfy_url": "",
+    "telegram_bot_token": "",
+    "telegram_chat_id": "",
+    "min_level": "info"
+  },
+  "ngrok": {
+    "_comment": "ngrok agent auth token and your reserved domain (host name only, no https://). Used by install.sh and 'python -m tvbridge ngrok-config'.",
+    "authtoken": "",
+    "domain": ""
+  }
+}
