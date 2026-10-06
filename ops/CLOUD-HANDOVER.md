@@ -23,7 +23,16 @@ cloud environment's secrets (see "Secrets" below).
 - MT5 main window is held at 0,0 1024x728 (env TVBRIDGE_WIN_GEOMETRY) because the console
   is 1024x768. Do not maximise it.
 
-## Common commands (over SSH)
+## From a Claude cloud session: use Systems Manager, not SSH
+The cloud sandbox only allows web (HTTPS) connections, so SSH to the server is impossible from
+there. Use AWS Systems Manager instead: the server is registered (role tvbridge-ssm-role) and
+the `claude-cloud` user may send commands. `ops/ssm.sh '<PowerShell>'` runs a command on the
+server and prints its output (needs `pip install awscli` and the AWS_* variables). Commands
+run as SYSTEM in session 0, exactly like SSH did: status, logs, config, database and engine
+restarts work directly; anything that needs the desktop goes through a job file for the
+`tvb-runner` task (see below). Example: `ops/ssm.sh 'C:\tvbridge-setup\status.ps1'`.
+
+## Common commands (over SSH or ops/ssm.sh)
 - Status: `C:\tvbridge-setup\status.ps1`
 - Pause / resume entries: `C:\tvbridge-setup\tvb.ps1 pause` / `... resume`
 - Flatten everything: `C:\tvbridge-setup\tvb.ps1 flatten` (asks for confirmation)
@@ -48,11 +57,11 @@ cloud environment's secrets (see "Secrets" below).
 - The5ers: deferred (needs the 4 GB size = AWS paid plan; account has little loss room).
 
 ## Secrets the cloud environment needs
-- `HANTEC_SSH_KEY`: contents of the Mac's ~/.ssh/hantec-pilot.pem (RSA private key).
-  Write it to a file with mode 600 before use.
-- `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` (+ `AWS_DEFAULT_REGION=eu-north-1`): an IAM
-  user limited to EC2 (security groups, instance start/stop/describe). Needed only to change
-  the firewall or restart the instance.
+- `HANTEC_SSH_KEY`: contents of the Mac's ~/.ssh/hantec-pilot.pem (RSA private key). Only
+  useful where raw SSH is possible (not from the Claude cloud sandbox).
+- `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` (+ `AWS_DEFAULT_REGION=eu-north-1`): the IAM
+  user `claude-cloud` (AmazonEC2FullAccess + AmazonSSMFullAccess). This is the main way in from
+  the cloud: Systems Manager commands, plus firewall and instance operations.
 - Network: the environment must be allowed to open SSH (port 22) to 16.192.38.115 and HTTPS
   to the ngrok domain. The server's SSH rule must admit the environment's address range
   (0.0.0.0/0 with key-only auth is the practical setting).
