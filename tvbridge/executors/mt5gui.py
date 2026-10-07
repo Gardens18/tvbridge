@@ -90,7 +90,7 @@ ROW_GAP_FACTOR = 1.75          # a gap this many times the row pitch means a row
 SINGLE_GAP_FACTOR = 2.5        # header -> account line (no rows): at most this many text heights
 MONEY_TOL_USD = 2.0
 MONEY_TOL_REL = 0.02
-SWAP_ALLOWANCE_USD_PER_LOT = 5.0   # unexplained swap per lot tolerated when no Swap column is shown
+SWAP_ALLOWANCE_USD_PER_LOT = 40.0  # swap per lot tolerated when no Swap column is shown (metals held several nights accrue 10-15 USD/lot/night)
 PRICE_BAND_REL = 0.01          # a fill further than this from the alert price is a mismatch ...
 PRICE_BAND_SL_POINTS = 100     # ... unless within 100 x min_sl_points x point
 
