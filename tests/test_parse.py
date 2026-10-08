@@ -1,5 +1,6 @@
 import unittest
 
+from tvbridge.gui import parse
 from tvbridge.gui.driver import OcrItem
 from tvbridge.gui.parse import (
     account_line_y, find_items, find_symbol, find_trade_header, group_rows, nearest_label, parse_account_line,
@@ -142,6 +143,29 @@ class AccountLineTests(unittest.TestCase):
     def test_ignores_position_rows(self):
         items = [item(EURUSD_ROW, y=100, w=700), item(ACCOUNT_LINE, y=140, w=760)]
         self.assertEqual(parse_account_line(items)["balance"], 50000.0)
+
+
+class HistoryTabTests(unittest.TestCase):
+    def items(self, *texts):
+        return [OcrItem(text=t, conf=0.95, x=10.0 + 120.0 * i, y=float(100 + 20 * (i // 12)), w=80.0, h=12.0)
+                for i, t in enumerate(texts)]
+
+    def test_trade_header_is_not_history(self):
+        items = self.items("Symbol", "Ticket", "Time", "Type", "Volume", "Price", "S / L", "T / P", "Price",
+                           "Profit", "", "")
+        self.assertFalse(parse.looks_like_history_tab(items))
+
+    def test_change_column_marks_history(self):
+        items = self.items("Time", "Symbol", "Ticket", "Type", "Volume", "Price", "S / L", "T / P", "Time",
+                           "Price", "Profit", "Change")
+        self.assertTrue(parse.looks_like_history_tab(items))
+
+    def test_summary_line_and_initial_deposit_mark_history(self):
+        line = "Profit: -291.89  Credit: 0.00  Deposit: 50 000.00  Withdrawal: 0.00  Balance: 49 708.11"
+        self.assertTrue(parse.looks_like_history_tab([OcrItem(line, 0.95, 10.0, 100.0, 500.0, 12.0)]))
+        self.assertTrue(parse.looks_like_history_tab([OcrItem("balance  Initial Deposit", 0.95, 10.0, 100.0, 200.0, 12.0)]))
+        self.assertFalse(parse.looks_like_history_tab([OcrItem("Balance: 49 708.11 USD  Equity: 49 708.11",
+                                                                 0.95, 10.0, 100.0, 300.0, 12.0)]))
 
 
 class PositionRowTests(unittest.TestCase):

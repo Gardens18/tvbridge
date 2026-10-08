@@ -430,6 +430,23 @@ class ReadAccountTests(GuiTestCase):
         self.assertEqual(cm.exception.code, "ACCOUNT_UNREADABLE")
         self.assertEqual(self.fake.clicks(), [])
 
+    def test_history_tab_is_switched_to_trade_before_reading_positions(self):
+        # native MT5 still exposes the Trade tab's account line while History is shown: the
+        # closed deals must never be read as open positions
+        ex = self.make(toolbox_tab="history", positions=[pos(111111)])
+        snap = ex.read_account()
+        self.assertAlmostEqual(snap.balance, 50000.0)
+        self.assertEqual([p.ticket for p in snap.positions], ["111111"])
+        tab = (MAIN_RECT[0] + TRADE_TAB_POINT[0], MAIN_RECT[1] + TRADE_TAB_POINT[1], 1)
+        self.assertIn(tab, self.fake.clicks())
+        self.assertEqual(self.fake.toolbox_tab, "trade")
+
+    def test_history_tab_that_stays_raises_instead_of_reporting_deals(self):
+        ex = self.make(toolbox_tab="history", trade_tab_works=False)
+        with self.assertRaises(ExecutorError) as cm:
+            ex.read_account()
+        self.assertEqual(cm.exception.code, "TOOLBOX_HISTORY_TAB")
+
     def test_low_confidence_items_are_dropped(self):
         ex = self.make()
         items, _png = ex._ocr(self.fake.main_window(), None, "t")

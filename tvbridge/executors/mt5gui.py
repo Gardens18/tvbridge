@@ -1060,7 +1060,10 @@ class Mt5GuiExecutor(Executor):
         items, png = self._ocr(main, region, tag)
         self._scan_pngs.append(png)
         acct = parse.parse_account_line(items)
-        if acct is None and self.calib.trade_tab_point and not self._main_size_issue(main):
+        # Native MT5 exposes the Trade tab's account line even while another tab is shown, so
+        # the History tab (closed deals) would read as positions: it is detected on its own.
+        history = parse.looks_like_history_tab(items)
+        if (acct is None or history) and self.calib.trade_tab_point and not self._main_size_issue(main):
             # Find the "Trade" tab by reading the Toolbox tab row (bottom of the window). MT5
             # hides Trade/Exposure/History while it is not connected: then nothing is clicked.
             strip = (0.0, float(main.h) - 50.0, min(float(main.w), 900.0), 50.0)
@@ -1080,7 +1083,8 @@ class Mt5GuiExecutor(Executor):
                 raise ExecutorError("MT5_DISCONNECTED",
                                     "the Toolbox has no Trade tab: MT5 is not connected to the account "
                                     "(screenshot %s)" % png)
-            log.info("account line not readable (%s); selecting the Trade tab and retrying", png)
+            log.info("%s (%s); selecting the Trade tab and retrying",
+                     "the Toolbox shows the History tab" if history else "account line not readable", png)
             self._focus(main)
             x, y = spot
             self.driver.click(x, y)
@@ -1088,9 +1092,14 @@ class Mt5GuiExecutor(Executor):
             items, png = self._ocr(main, region, tag + "_retry")
             self._scan_pngs.append(png)
             acct = parse.parse_account_line(items)
+            history = parse.looks_like_history_tab(items)
         if acct is None:
             raise ExecutorError("ACCOUNT_UNREADABLE",
                                 "Balance/Equity not readable in the MT5 Toolbox (screenshot %s)" % png)
+        if history:
+            raise ExecutorError("TOOLBOX_HISTORY_TAB",
+                                "the MT5 Toolbox shows the History tab (closed deals), not the Trade tab, and "
+                                "selecting the Trade tab did not help; select it by hand (screenshot %s)" % png)
         return items, png, acct
 
     def _positions(self, items: List[Any]) -> List[Tuple[ObservedPosition, Any]]:

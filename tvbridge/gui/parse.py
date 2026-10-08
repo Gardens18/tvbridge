@@ -347,6 +347,25 @@ def find_trade_header(items: List[OcrItem]) -> Optional[Dict[str, object]]:
     return None
 
 
+_HISTORY_SUMMARY_RE = re.compile(r"\b(deposit|withdrawal|credit)\s*[:;]", re.I)
+_INITIAL_DEPOSIT_RE = re.compile(r"\binitial\s+deposit\b", re.I)
+
+
+def looks_like_history_tab(items: List[OcrItem]) -> bool:
+    """True when the Toolbox list is the History tab (closed deals), which must never be read
+    as open positions: its header carries a "Change" column after Profit, its summary line
+    shows Deposit / Withdrawal / Credit, or a "balance" / "Initial Deposit" row is listed."""
+    for row in group_rows(items):
+        text = row_text(row)
+        if not text:
+            continue
+        if _word_re("symbol").search(text) and _word_re("profit").search(text) and _word_re("change").search(text):
+            return True
+        if _HISTORY_SUMMARY_RE.search(text) or _INITIAL_DEPOSIT_RE.search(text):
+            return True
+    return False
+
+
 def account_line_y(items: List[OcrItem]) -> Optional[float]:
     """Centre y of the Toolbox row holding "Balance:"/"Equity:", or None."""
     for row in group_rows(items):

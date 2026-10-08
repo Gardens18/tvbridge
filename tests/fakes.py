@@ -720,6 +720,34 @@ class FakeMt5Driver(Driver):
             it("Journal", mx + 250, tab_y),
         ]
         top = my - self.list_dy()          # the Trade list moves with the Toolbox
+        if self.toolbox_tab == "history":
+            # closed deals: a "Change" column, a balance row, a summary line -- and, like native
+            # MT5, the Trade tab's account line still exposed as (hidden) control text
+            header_y = top + 615
+            for text, x in (("Time", 30), ("Symbol", 120), ("Ticket", 200), ("Type", 300), ("Volume", 370),
+                            ("Price", 440), ("S / L", 520), ("T / P", 600), ("Time", 680), ("Price", 760),
+                            ("Profit", 860), ("Change", 940)):
+                items.append(it(text, mx + x, header_y))
+            y = self.row_y(0)
+            items += [it("2026.10.05 13:00", mx + 30, y), it("252061", mx + 200, y), it("balance", mx + 300, y),
+                      it("Initial Deposit", mx + 440, y), it("50 000.00", mx + 860, y)]
+            y = self.row_y(1)
+            items += [it("2026.10.06 02:00", mx + 30, y), it("xauusd.h", mx + 120, y), it("233613", mx + 200, y),
+                      it("sell", mx + 300, y), it("0.53", mx + 370, y), it("4139.31", mx + 440, y),
+                      it("4147.52", mx + 520, y), it("4147.64", mx + 760, y), it("-441.49", mx + 860, y),
+                      it("-0.20 %", mx + 940, y)]
+            y = self.row_y(2)
+            items.append(it("Profit: -441.49  Credit: 0.00  Deposit: 50 000.00  Withdrawal: 0.00  Balance: %s"
+                            % fmt_money(self.balance), mx + 400, y))
+            acct_y = self.row_y(3)
+            equity = self.equity()
+            items += [
+                it("Balance: %s USD" % fmt_money(self.balance), mx + 90, acct_y),
+                it("Equity: %s" % fmt_money(equity), mx + 260, acct_y),
+                it("Margin: 0.00", mx + 400, acct_y),
+                it("Free Margin: %s" % fmt_money(equity), mx + 560, acct_y),
+            ]
+            return items
         if self.toolbox_tab != "trade":
             items += [
                 it("Time", mx + 60, top + 615), it("Source", mx + 200, top + 615),
