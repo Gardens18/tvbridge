@@ -50,6 +50,10 @@ POSITION_DIALOG_SIZE = (620.0, 470.0)
 CLOSE_BUTTON_POINT = (310.0, 380.0)                     # relative to the position dialog origin
 POSITION_VOLUME_POINT = (150.0, 130.0)                  # volume field of the position dialog
 DEFAULT_ORDER_QUOTE = "1.08340 / 1.08345"
+SYMBOLS_WINDOW_RECT = (178.0, 186.0, 705.0, 476.0)      # View > Symbols window (x, y, w, h)
+SYMBOLS_SEARCH_POINT = (350.0, 78.0)                     # relative: search field (as the executor clicks it)
+SYMBOLS_ROW_POINT = (430.0, 313.0)                       # relative: the single matching row
+SYMBOLS_SHOW_POINT = (81.0, 456.0)                       # relative: "Show Symbol" button
 
 TOOLBOX_REGION = [0.0, 600.0, 1440.0, 250.0]            # relative to the main window
 FOCUS_POINT = [720.0, 12.0]
@@ -65,6 +69,7 @@ DESCRIPTIONS = {
     "EURUSD.h": "Euro vs US Dollar",
     "GBPUSD.h": "Great Britain Pound vs US Dollar",
     "USDJPY.h": "US Dollar vs Japanese Yen",
+    "XAGUSD.h": "Silver vs US Dollar",
 }
 
 WARNING_TEXT = ("Attention! The trade will be executed at market conditions, "
@@ -179,6 +184,11 @@ class FakeMt5Driver(Driver):
         order_quote: str = DEFAULT_ORDER_QUOTE,
         # the position dialog's volume field ignores typing (the button keeps the full volume)
         position_volume_ignores_typing: bool = False,
+        # symbols the order dialog accepts (MT5's Market Watch); None = every symbol. Others are
+        # silently refused: the dialog keeps its previous symbol, like real MT5
+        market_watch: Optional[List[str]] = None,
+        # symbols the (fake) broker offers in the Symbols window (Ctrl+U)
+        server_symbols: Optional[List[str]] = None,
     ):
         self.main_title = main_title
         self.positions = [dict(p) for p in (positions or [])]
@@ -215,6 +225,9 @@ class FakeMt5Driver(Driver):
         self.stray_modal = stray_modal
         self.order_quote = order_quote
         self.position_volume_ignores_typing = position_volume_ignores_typing
+        self.market_watch = list(market_watch) if market_watch is not None else None  # type: Optional[List[str]]
+        self.server_symbols = list(server_symbols) if server_symbols is not None else list(DESCRIPTIONS)
+        self.shown_symbols = []     # type: List[str]   symbols added via the Symbols window
 
         self.now = 0.0
         self._seq = 0
@@ -382,6 +395,10 @@ class FakeMt5Driver(Driver):
             if top is None and self.dialog_opens:
                 self._schedule(self.dialog_delay_s, self._open_order_dialog)
             return
+        if name == "u" and "ctrl" in mods:
+            if top is None:
+                self._open_symbols_window()
+            return
         if top is None:
             return
         if name == "escape":
@@ -396,7 +413,7 @@ class FakeMt5Driver(Driver):
             elif top.kind in ("order", "position"):
                 self.dangerous_returns += 1
             return
-        if top.kind not in ("order", "position") or top.page != "form" or top.focused is None:
+        if top.kind not in ("order", "position", "symbols") or top.page != "form" or top.focused is None:
             return
         if name == "end":
             top.selected = False
@@ -404,7 +421,12 @@ class FakeMt5Driver(Driver):
             top.selected = True
         elif name == "tab":
             if top.focused == "symbol":
-                self.current_symbol = top.fields["symbol"]
+                typed = top.fields["symbol"]
+                if self.market_watch is not None and typed not in self.market_watch:
+                    top.fields["symbol"] = self.current_symbol      # refused: previous symbol kept
+                else:
+                    self.current_symbol = typed
+                    top.title = self._order_title(typed)
             top.focused = None
             top.selected = False
 
@@ -415,7 +437,8 @@ class FakeMt5Driver(Driver):
             self.lost_keys.append(text)
             return
         top = self._top_dialog()
-        if top is None or top.kind not in ("order", "position") or top.page != "form" or top.focused is None:
+        if top is None or top.kind not in ("order", "position", "symbols") or top.page != "form" \
+                or top.focused is None:
             return
         name = top.focused
         if name == "volume" and top.kind == "order" and self.volume_ignores_typing:
@@ -469,10 +492,22 @@ class FakeMt5Driver(Driver):
 
     # ------------------------------------------------------------------ MT5 behaviour
 
+    def _order_title(self, symbol: str) -> str:
+        return "Order: %s - %s" % (symbol, DESCRIPTIONS.get(symbol, symbol))
+
     def _open_order_dialog(self) -> None:
         w, h = self.dialog_size
-        d = self._new_dialog("order", "Order", ORDER_DIALOG_ORIGIN[0], ORDER_DIALOG_ORIGIN[1], w, h)
+        d = self._new_dialog("order", self._order_title(self.current_symbol),
+                             ORDER_DIALOG_ORIGIN[0], ORDER_DIALOG_ORIGIN[1], w, h)
         d.fields = {"symbol": self.current_symbol, "volume": "0.01", "sl": "0.00000", "tp": "0.00000"}
+        self.dialogs.append(d)
+        self.active_pid = MT5_PID
+
+    def _open_symbols_window(self) -> None:
+        """View > Symbols (Ctrl+U): a search field, the matching row and a "Show Symbol" button."""
+        x, y, w, h = SYMBOLS_WINDOW_RECT
+        d = self._new_dialog("symbols", "Symbols", x, y, w, h)
+        d.fields = {"search": "", "row": ""}
         self.dialogs.append(d)
         self.active_pid = MT5_PID
 
@@ -496,6 +531,23 @@ class FakeMt5Driver(Driver):
 
     def _click_dialog(self, d: FakeDialog, x: float, y: float, count: int) -> None:
         if d.page != "form" or d.pending:
+            return
+        if d.kind == "symbols":
+            sx, sy = SYMBOLS_SEARCH_POINT
+            if _hit(x, y, d.x + sx, d.y + sy, FIELD_HALF):
+                d.focused = "search"
+                d.selected = False
+                return
+            rx, ry = SYMBOLS_ROW_POINT
+            if _hit(x, y, d.x + rx, d.y + ry, FIELD_HALF) and d.fields["search"] in self.server_symbols:
+                d.fields["row"] = d.fields["search"]
+                return
+            bx, by = SYMBOLS_SHOW_POINT
+            if _hit(x, y, d.x + bx, d.y + by, BUTTON_HALF) and d.fields["row"]:
+                sym = d.fields["row"]
+                self.shown_symbols.append(sym)
+                if self.market_watch is not None and sym not in self.market_watch:
+                    self.market_watch.append(sym)
             return
         if d.kind == "order":
             for name in ("symbol", "volume", "sl", "tp"):
@@ -716,6 +768,16 @@ class FakeMt5Driver(Driver):
         it = self._item
         if d.kind == "stray":
             return [it("Alert", d.x + 160, d.y + 40), it("Connection restored", d.x + 160, d.y + 80)]
+        if d.kind == "symbols":
+            sx, sy = SYMBOLS_SEARCH_POINT
+            bx, by = SYMBOLS_SHOW_POINT
+            out = [it("Symbols", d.x + 40, d.y + 10, 1.0), it(d.fields["search"] or "Search", d.x + sx, d.y + sy, 1.0),
+                   it("Show Symbol", d.x + bx, d.y + by, 1.0)]
+            q = d.fields["search"]
+            if q and q in self.server_symbols:
+                rx, ry = SYMBOLS_ROW_POINT
+                out.append(it(q, d.x + rx, d.y + ry, 0.9))    # a pixel-read row (confidence < 1)
+            return out
         if d.page == "result":
             return [it(d.result_text, d.x + d.w / 2, d.y + 200), it("OK", d.x + d.w / 2, d.y + 420)]
         if d.kind == "position":

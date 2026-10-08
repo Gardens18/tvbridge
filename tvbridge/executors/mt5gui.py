@@ -73,6 +73,11 @@ T = TypeVar("T")
 POLL_INTERVAL_S = 0.1          # window polling interval
 RESULT_POLL_S = 0.5            # result OCR polling interval
 SYMBOL_SETTLE_S = 0.5          # MT5 reloads prices after the symbol changes
+SYMBOL_SELECT_TIMEOUT_S = 3.0  # the order window's title must name the typed symbol within this
+SYMBOLS_WINDOW_TITLE = "Symbols"
+SYMBOLS_SEARCH_OFFSET = (350.0, 78.0)   # search field of MT5's Symbols window (Windows build)
+SYMBOLS_FILTER_SETTLE_S = 3.0           # the Symbols window filters its tree after typing
+SYMBOLS_SHOW_BUTTON = "show symbol"
 STRAY_CLOSE_WAIT_S = 1.0       # wait for a stray dialog to close after Escape
 LABEL_MAX_DIST = 80.0          # max distance (points) between button point and its OCR label
 MAX_CLOSE_ITERATIONS = 10
@@ -95,6 +100,7 @@ PRICE_BAND_REL = 0.01          # a fill further than this from the alert price i
 PRICE_BAND_SL_POINTS = 100     # ... unless within 100 x min_sl_points x point
 
 _TICKET_RE = re.compile(r"#\s?(\d{4,})")
+_ORDER_TITLE_RE = re.compile(r"^\s*order\s*:\s*([^\s,\-]+)", re.IGNORECASE)   # "Order: XAUUSD.h - Gold ..."
 _SIDE_RE = re.compile(r"\b(buy|sell)\b", re.IGNORECASE)
 _TAG_RE = re.compile(r"[^A-Za-z0-9_-]+")
 _VOLUME_LABEL_RE = re.compile(r"\bvolume\b\s*[:;.]?", re.IGNORECASE)
@@ -314,6 +320,9 @@ class Mt5GuiExecutor(Executor):
         self._acct_fail_streak = 0
         self._scan_pngs = []  # type: List[str]
         self._last_toolbox_issue = ""
+        #: Add a missing symbol to the Market Watch through MT5's Symbols window (Ctrl+U) when the
+        #: order window refuses it. Native Windows MT5 only: its Symbols window is calibrated here.
+        self.can_add_symbols = os.name == "nt"
 
     @property
     def mode(self) -> str:
@@ -492,6 +501,91 @@ class Mt5GuiExecutor(Executor):
         x = it.x + it.w * ((m.start() + m.end()) / 2.0) / n
         self.driver.click(x, it.cy)
         return self._wait_for_new_window(main.pid, before, gui.order_dialog_title_contains, gui.dialog_timeout_s)
+
+    def _open_checked_dialog(self, main: Any, state: Dict[str, Any]) -> Any:
+        """Open the New Order window and check its calibrated size (ExecutorError otherwise)."""
+        gui = self.gui
+        before = {w.wid for w in self._windows()}
+        dlg = self._open_order_dialog(main, before)
+        if dlg is None:
+            raise ExecutorError("ORDER_DIALOG_NOT_OPENED", "F9 did not open a window titled %s within %.1f s"
+                                % (list(gui.order_dialog_title_contains), float(gui.dialog_timeout_s)))
+        state["dlg"] = dlg
+        od = self.calib.order_dialog
+        cw, ch = float(od["w"]), float(od["h"])
+        tol = float(gui.size_tolerance_px)
+        if abs(dlg.w - cw) > tol or abs(dlg.h - ch) > tol:
+            raise ExecutorError(
+                "DIALOG_LAYOUT_CHANGED",
+                "order dialog is %.0fx%.0f, calibrated %.0fx%.0f (tolerance %.0f); run `tvbridge calibrate`"
+                % (dlg.w, dlg.h, cw, ch, tol))
+        return dlg
+
+    def _wait_symbol_shown(self, dlg: Any, symbol: str) -> Optional[bool]:
+        """Does the order window's title name ``symbol``? True / False, or None when the title
+        names no symbol at all (older builds: the field verification catches it later)."""
+        want = _norm(symbol)
+
+        def probe() -> Optional[bool]:
+            cur = self._find_window(dlg.wid)
+            if cur is None:
+                return None
+            m = _ORDER_TITLE_RE.match(cur.title or "")
+            if not m:
+                return None
+            return True if _norm(m.group(1)) == want else None
+
+        if self._poll(SYMBOL_SELECT_TIMEOUT_S, POLL_INTERVAL_S, probe):
+            return True
+        cur = self._find_window(dlg.wid)
+        if cur is None or not _ORDER_TITLE_RE.match(cur.title or ""):
+            return None
+        return False
+
+    def _add_symbol_to_market_watch(self, main: Any, symbol: str) -> bool:
+        """Show ``symbol`` in the Market Watch through MT5's Symbols window (Ctrl+U): type it in
+        the search field, click its row, click "Show Symbol", close the window. True on success;
+        never raises (a failure just means the entry is refused)."""
+        gui = self.gui
+        try:
+            self._focus(main)
+            before = {w.wid for w in self._windows()}
+            self.driver.key("u", ("ctrl",))
+            win = self._wait_for_new_window(main.pid, before, [SYMBOLS_WINDOW_TITLE], gui.dialog_timeout_s)
+            if win is None:
+                log.warning("Ctrl+U did not open the Symbols window")
+                return False
+            try:
+                dx, dy = SYMBOLS_SEARCH_OFFSET
+                self.driver.click(win.x + dx, win.y + dy)
+                self.driver.sleep(gui.action_delay_s)
+                self.driver.type_text(symbol)
+                self.driver.sleep(SYMBOLS_FILTER_SETTLE_S)
+                cur = self._find_window(win.wid) or win
+                png = str(self._shot_path("symbols_%s" % symbol))
+                scale = self.driver.capture(cur, png)
+                items = self.driver.ocr(png, cur, scale)
+                rows = [i for i in items
+                        if parse.find_symbol(i.text or "", [symbol]) is not None and float(i.conf or 0) < 1.0]
+                buttons = [i for i in items if _norm(i.text) == SYMBOLS_SHOW_BUTTON]
+                if not rows or not buttons:
+                    log.warning("Symbols window: row for %s %s, Show Symbol button %s (%s)", symbol,
+                                "found" if rows else "not found", "found" if buttons else "not found", png)
+                    return False
+                row = sorted(rows, key=lambda i: i.y)[0]
+                self.driver.click(row.cx, row.cy)
+                self.driver.sleep(gui.action_delay_s)
+                self.driver.click(buttons[0].cx, buttons[0].cy)
+                self.driver.sleep(gui.action_delay_s)
+                log.info("added %s to the Market Watch (Symbols window)", symbol)
+                return True
+            finally:
+                cur = self._find_window(win.wid)
+                if cur is not None and not self._escape_window(cur, main.pid):
+                    log.warning("the Symbols window did not close")
+        except Exception as e:   # pragma: no cover - defensive
+            log.warning("adding %s to the Market Watch failed: %s: %s", symbol, type(e).__name__, e)
+            return False
 
     @staticmethod
     def _point(win: Any, rel: Sequence[float]) -> Tuple[float, float]:
@@ -702,28 +796,35 @@ class Mt5GuiExecutor(Executor):
             raise ExecutorError("MAIN_LAYOUT_CHANGED", "%s; run `tvbridge calibrate`" % issue)
         self._dismiss_stray_dialogs(main)
         self._focus(main)
-        before = {w.wid for w in self._windows()}
-        dlg = self._open_order_dialog(main, before)
-        if dlg is None:
-            raise ExecutorError("ORDER_DIALOG_NOT_OPENED", "F9 did not open a window titled %s within %.1f s"
-                                % (list(gui.order_dialog_title_contains), float(gui.dialog_timeout_s)))
-        state["dlg"] = dlg
-
-        # 2. layout check
+        dlg = self._open_checked_dialog(main, state)   # 2. incl. layout check
         od = self.calib.order_dialog
-        cw, ch = float(od["w"]), float(od["h"])
-        tol = float(gui.size_tolerance_px)
-        if abs(dlg.w - cw) > tol or abs(dlg.h - ch) > tol:
-            raise ExecutorError(
-                "DIALOG_LAYOUT_CHANGED",
-                "order dialog is %.0fx%.0f, calibrated %.0fx%.0f (tolerance %.0f); run `tvbridge calibrate`"
-                % (dlg.w, dlg.h, cw, ch, tol))
-
-        # 3. fill the fields
         pts = od["points"]
-        sx, sy = self._point(dlg, pts["symbol"])
-        self._set_field(sx, sy, req.symbol)
-        self.driver.sleep(SYMBOL_SETTLE_S)
+
+        # 3. the symbol: MT5 silently keeps the previous symbol when the typed one is not in
+        # its Market Watch (MT5 hides symbols no chart or position uses after a while). The
+        # window title names the selected symbol: wait for it, add the symbol once if needed.
+        for attempt in (1, 2):
+            sx, sy = self._point(dlg, pts["symbol"])
+            self._set_field(sx, sy, req.symbol)
+            self.driver.sleep(SYMBOL_SETTLE_S)
+            shown = self._wait_symbol_shown(dlg, req.symbol)
+            if shown is not False:
+                break
+            cur = self._find_window(dlg.wid)
+            if cur is not None:
+                self._escape_window(cur, main.pid)
+            state["dlg"] = None
+            added = attempt == 1 and self.can_add_symbols and self._add_symbol_to_market_watch(main, req.symbol)
+            if not added:
+                msg = ("SYMBOL_NOT_SELECTED: the order window kept its previous symbol after %r was typed: "
+                       "%s is not in MT5's Market Watch (View > Symbols > Show Symbol)%s; nothing was sent"
+                       % (req.symbol, req.symbol, "" if attempt == 1 else " and adding it did not help"))
+                log.warning(msg)
+                return OrderResult("error", msg, evidence=evidence)
+            log.warning("%s was not selectable in the order window; added it to the Market Watch, retrying",
+                        req.symbol)
+            self._focus(main)
+            dlg = self._open_checked_dialog(main, state)
 
         # 3b. mirror mode: stop/target at a fixed distance from this ticket's own quote
         if by_distance:

@@ -921,3 +921,59 @@ class MakeExecutorLoginTests(MakeExecutorGuiTests):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SymbolSelectionTests(GuiTestCase):
+    """MT5 keeps the previous symbol when the typed one is not in its Market Watch."""
+
+    def test_normal_entry_sees_the_symbol_in_the_title(self):
+        ex = self.make(market_watch=["EURUSD.h", "XAGUSD.h"], fill_price=60.01)
+        res = ex.open_market(buy_req(symbol="XAGUSD.h", sl=59.0, tp=61.0, digits=3, price=60.0))
+        self.assertEqual(res.status, "filled", res.message)
+        self.assertEqual(self.fake.orders_sent[0]["symbol"], "XAGUSD.h")
+        self.assertEqual(self.fake.shown_symbols, [])
+
+    def test_refused_symbol_is_never_sent(self):
+        ex = self.make(market_watch=["EURUSD.h"])
+        ex.can_add_symbols = False
+        res = ex.open_market(buy_req(symbol="XAGUSD.h", sl=59.0, tp=61.0, digits=3, price=60.0))
+        self.assertEqual(res.status, "error")
+        self.assertTrue(res.message.startswith("SYMBOL_NOT_SELECTED"), res.message)
+        self.assertIn("Market Watch", res.message)
+        self.assertNoOrderButtonClicked()
+        self.assertNoDialogs()
+        self.assertEqual(self.fake.typed(), ["XAGUSD.h"])
+        self.assertEqual(self.fake.shown_symbols, [])
+
+    def test_missing_symbol_is_added_through_the_symbols_window_then_sent(self):
+        ex = self.make(market_watch=["EURUSD.h"], fill_price=60.01)
+        ex.can_add_symbols = True
+        res = ex.open_market(buy_req(symbol="XAGUSD.h", sl=59.0, tp=61.0, digits=3, price=60.0))
+        self.assertEqual(res.status, "filled", res.message)
+        self.assertEqual(self.fake.shown_symbols, ["XAGUSD.h"])
+        self.assertEqual(self.fake.market_watch, ["EURUSD.h", "XAGUSD.h"])
+        self.assertEqual(self.fake.orders_sent, [
+            {"side": "buy", "symbol": "XAGUSD.h", "volume": "0.50", "sl": "59.000", "tp": "61.000"}])
+        self.assertEqual(self.fake.order_button_clicks, ["buy"])
+        self.assertNoDialogs()
+        # typed: order window (refused), Symbols search, order window again, then the fields
+        self.assertEqual(self.fake.typed(), ["XAGUSD.h", "XAGUSD.h", "XAGUSD.h", "0.50", "59.000", "61.000"])
+        self.assertIn(("key", "u", ("ctrl",)), self.fake.actions)
+
+    def test_symbol_unknown_to_the_broker_is_refused_after_one_attempt(self):
+        ex = self.make(market_watch=["EURUSD.h"])
+        ex.can_add_symbols = True
+        res = ex.open_market(buy_req(symbol="XPTUSD.h", sl=900.0, tp=1000.0, digits=2, price=950.0))
+        self.assertEqual(res.status, "error")
+        self.assertTrue(res.message.startswith("SYMBOL_NOT_SELECTED"), res.message)
+        self.assertNoOrderButtonClicked()
+        self.assertNoDialogs()          # the Symbols window was closed again
+        self.assertEqual(self.fake.shown_symbols, [])
+
+    def test_rehearsal_also_refuses_a_missing_symbol(self):
+        ex = self.make(rehearsal=True, market_watch=["EURUSD.h"])
+        ex.can_add_symbols = False
+        res = ex.open_market(buy_req(symbol="XAGUSD.h", sl=59.0, tp=61.0, digits=3, price=60.0))
+        self.assertEqual(res.status, "error")
+        self.assertTrue(res.message.startswith("SYMBOL_NOT_SELECTED"), res.message)
+        self.assertNoDialogs()
