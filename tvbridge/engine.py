@@ -72,6 +72,9 @@ _KIND_FOR_ACTION = {"buy": OPEN, "sell": OPEN, "close": CLOSE, "close_all": CLOS
 MIRROR_SCALE_PREFIX = "mirror_scale:"
 #: Signal.raw key of a fan-out child (value: the parent signal's id); a child never fans out again
 FAN_OUT_PARENT = "fan_out_parent"
+REENTRY_SEP = "~re"             # re-entry signal ids: "<sync id>~re<n>"
+REENTRY_OF = "reentry_of"       # raw key: ledger pid of the stopped position a re-entry replaces
+REENTRY_PRICE_GAP_PCT = 3.0     # price-gap allowance for a re-entry (its hint is the old stop level)
 LOTS_EPS = 1e-9
 
 ACCOUNT_REFRESH_S = 5.0        # an entry re-reads the account if the last read is older than this
@@ -369,6 +372,8 @@ class Engine:
         self._positions_unknown_reads = 0
         self._positions_note = ""
         self._pending_adoptions = []  # type: List[Tuple[Signal, TradePlan, float]]
+        # re-entries after a broker-side stop waiting for their cooldown: (due monotonic, signal, pid)
+        self._pending_reentries = []  # type: List[Tuple[float, Signal, int]]
         self._read_failures = 0
         self._last_read_error = ""
         self._preclick_failures = 0
@@ -888,6 +893,95 @@ class Engine:
             return "margin %s -> %s" % (_money(m0), _money(snap.margin))
         return ""
 
+    # ------------------------------------------------------------------ re-entry after a stop
+
+    @staticmethod
+    def _reentry_base_id(sig_id: str) -> str:
+        return sig_id.split(REENTRY_SEP, 1)[0]
+
+    def _maybe_schedule_reentry(self, pid: int, row: Dict[str, Any], desc: str,
+                                basis: Optional[Tuple[float, Optional[float]]], snap: AccountSnapshot) -> None:
+        """After MT5 closed ledger row ``pid`` on its own: if it was a loss (the stop) and the
+        strategy's latest sync on the symbol still holds that side, queue one re-entry of the
+        same sync after ``mirror.reenter_cooldown_s`` (at most ``mirror.reenter_max`` times)."""
+        m = self.cfg.mirror
+        if not m.enabled or not getattr(m, "reenter_after_stop", False) or int(m.reenter_max) <= 0:
+            return
+        symbol, side = str(row.get("symbol") or ""), str(row.get("side") or "")
+        delta = None  # type: Optional[float]
+        if basis is not None and _finite(basis[0]) and _finite(snap.balance):
+            delta = float(snap.balance) - float(basis[0])
+        if delta is None or delta >= 0:
+            log.info("no re-entry for %s: the close %s (take-profit or closed by hand, not the stop)", desc,
+                     "booked no loss" if delta is None else "made %s" % _money(delta))
+            return
+        last = self.store.latest_sync_signal(symbol)
+        try:
+            sig = Signal.from_dict(last["payload"]) if last is not None and isinstance(last.get("payload"), dict) \
+                else None
+        except (KeyError, TypeError, ValueError):
+            sig = None
+        if sig is None or sig.target_side != side or not (_finite(sig.target_units) and float(sig.target_units or 0) > 0):
+            log.info("no re-entry for %s: the strategy no longer holds a %s position on %s", desc, side, symbol)
+            return
+        base = self._reentry_base_id(sig.id)
+        n = 1
+        while n <= int(m.reenter_max) and self.store.get_signal_row("%s%s%d" % (base, REENTRY_SEP, n)) is not None:
+            n += 1
+        if n > int(m.reenter_max):
+            msg = ("%s was stopped out again; no further re-entry (mirror.reenter_max=%d reached for %s)"
+                   % (desc, int(m.reenter_max), base))
+            log.warning(msg)
+            self._event("warn", "reentry_exhausted", msg, {"pid": pid, "sync": base})
+            self._notify("tvbridge: no further re-entry", msg, "warn")
+            return
+        if any(p == pid for _, _, p in self._pending_reentries):
+            return
+        raw = dict(sig.raw or {})
+        raw.pop("prev_position", None)
+        raw.pop("prev_size", None)
+        raw.pop("prev_market_position", None)
+        raw.pop("prev_market_position_size", None)
+        raw[REENTRY_OF] = pid
+        price = float(row["sl"]) if _finite(row.get("sl")) and float(row.get("sl") or 0) > 0 else sig.price
+        child = dataclasses.replace(sig, id="%s%s%d" % (base, REENTRY_SEP, n), price=price, raw=raw)
+        cooldown = float(m.reenter_cooldown_s)
+        self._pending_reentries.append((time.monotonic() + cooldown, child, pid))
+        msg = ("%s was stopped out (%s) while the strategy still holds its %s position: re-entry %d of %d "
+               "in %.0f s" % (desc, _money(delta), side, n, int(m.reenter_max), cooldown))
+        log.info(msg)
+        self._event("info", "reentry_scheduled", msg, {"pid": pid, "sync": base, "signal_id": child.id,
+                                                       "cooldown_s": cooldown})
+        self._notify("tvbridge: re-entry scheduled", msg, "info")
+
+    def _run_due_reentries(self) -> None:
+        """Submit re-entries whose cooldown passed, unless the strategy changed its mind meanwhile."""
+        if not self._pending_reentries:
+            return
+        mono = time.monotonic()
+        keep = []  # type: List[Tuple[float, Signal, int]]
+        for due, child, pid in self._pending_reentries:
+            if mono < due:
+                keep.append((due, child, pid))
+                continue
+            last = self.store.latest_sync_signal(child.symbol)
+            same = (last is not None and self._reentry_base_id(str(last.get("id") or "")) == self._reentry_base_id(child.id))
+            if not same:
+                msg = "re-entry %s dropped: the strategy changed its position on %s meanwhile" % (child.id, child.symbol)
+                log.info(msg)
+                self._event("info", "reentry_dropped", msg, {"pid": pid, "signal_id": child.id})
+                continue
+            if self.store.get_signal_row(child.id) is not None:
+                continue
+            now = clock.utcnow()
+            child = dataclasses.replace(child, fired_at=now, received_at=now)
+            self.store.insert_signal(child)
+            msg = "re-entry %s submitted: %s" % (child.id, self._sync_desc(child))
+            log.info(msg)
+            self._event("info", "reentry_submitted", msg, {"pid": pid, "signal_id": child.id})
+            self.submit_signal(child)
+        self._pending_reentries = keep
+
     def _close_proof(self, pid: int, row: Dict[str, Any], snap: AccountSnapshot) -> str:
         """Proof that ledger row ``pid`` was closed: against the account when the row was last seen
         in MT5; for a row never seen since the fill (or since the start), against the account
@@ -977,6 +1071,7 @@ class Engine:
                                                          row.get("ticket") or "?", pid)
             proof = self._close_proof(pid, row, snap)
             if proof:
+                basis = self._seen_basis.get(pid) or self._open_basis.get(pid, self._basis_fallback)
                 self.store.close_ledger_position(pid, "closed_on_server", now)
                 counts.pop(pid, None)
                 self._seen_basis.pop(pid, None)
@@ -986,6 +1081,7 @@ class Engine:
                 log.info(msg)
                 self._event("info", "closed_on_server", msg, {"pid": pid, "signal_id": row.get("signal_id")})
                 self._notify("tvbridge: position closed on server", msg, "info")
+                self._maybe_schedule_reentry(pid, row, desc, basis, snap)
             elif pid not in self._uncertain_rows:
                 self._uncertain_rows[pid] = {"desc": desc, "since": now}
                 msg = ("%s is not visible in MT5 but the balance did not change, so it may still be open. Its "
@@ -2291,7 +2387,10 @@ class Engine:
         req = OrderRequest(
             symbol=sig.symbol, side=side, lots=lots, sl=float(entry.sl),  # type: ignore[arg-type]
             tp=entry.tp if entry.tp else None, digits=int(spec.digits), lot_decimals=spec.lot_decimals,
-            comment=sig.comment, price_hint=price, quote_usd=sig.quote_usd,
+            comment=sig.comment, quote_usd=sig.quote_usd, price_hint=price,
+            # a re-entry carries the stop price of the position it replaces, not a live alert price:
+            # the quote may have drifted further than the usual price-gap allowance
+            max_price_gap_pct=REENTRY_PRICE_GAP_PCT if (sig.raw or {}).get(REENTRY_OF) is not None else None,
             sl_distance=stop_dist, tp_distance=tp_dist if tp_dist else None,
         )
         log.info("mirror: executing %s %s %s (stop %s from the quote, risk %s USD) for %s", req.side, req.lots,
@@ -2538,6 +2637,7 @@ class Engine:
             self._last_poll_mono = mono
             self.request_account_poll()
         self._consume_command()
+        self._run_due_reentries()
         self._maybe_rollover()
         if mono - self._last_heartbeat_mono >= HEARTBEAT_S:
             self._write_heartbeat()

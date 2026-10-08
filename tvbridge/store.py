@@ -217,6 +217,14 @@ class Store:
         )
         return self._signal_row(newer)
 
+    def latest_sync_signal(self, symbol: str) -> Optional[Dict[str, Any]]:
+        """The newest ``sync`` signal on ``symbol`` (latest ``fired_at``, then stored last), any
+        status: the strategy's last known position on that symbol. None if there is none."""
+        row = self._one(
+            "SELECT * FROM signals WHERE action = 'sync' AND symbol = ? COLLATE NOCASE "
+            "ORDER BY fired_at DESC, rowid DESC LIMIT 1", (symbol,))
+        return self._signal_row(row)
+
     def recent_signals(self, limit: int = 20) -> List[Dict[str, Any]]:
         """Most recent signal rows, newest first."""
         rows = self._all("SELECT * FROM signals ORDER BY received_at DESC, rowid DESC LIMIT ?", (int(limit),))

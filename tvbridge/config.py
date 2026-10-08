@@ -204,6 +204,13 @@ class MirrorCfg:
     quote_usd_by_symbol: Dict[str, float] = field(default_factory=dict)
     # per-symbol override of max_price_gap_pct (wider for symbols converted with quote_usd_by_symbol)
     max_price_gap_pct_by_symbol: Dict[str, float] = field(default_factory=dict)
+    # Re-entry after a broker-side stop: when MT5 closes a mirrored position at a loss (its stop)
+    # while the strategy still holds that side (its latest sync on the symbol is unchanged), the
+    # position is opened again after reenter_cooldown_s, at most reenter_max times per strategy
+    # position. A close in profit (take-profit, manual) never re-enters.
+    reenter_after_stop: bool = False
+    reenter_cooldown_s: float = 60.0
+    reenter_max: int = 1
 
 
 @dataclass
@@ -885,6 +892,8 @@ def validate(cfg: Config) -> None:
     _req(0 <= m.idea_risk_pct <= 3, "mirror.idea_risk_pct must be between 0 and 3 (got %s)" % m.idea_risk_pct)
     _req(m.tp_distance >= 0, "mirror.tp_distance must be >= 0 (0 = no take-profit)")
     _req(m.size_tolerance_lots >= 0, "mirror.size_tolerance_lots must be >= 0")
+    _req(m.reenter_cooldown_s >= 0, "mirror.reenter_cooldown_s must be >= 0")
+    _req(0 <= int(m.reenter_max) <= 10, "mirror.reenter_max must be between 0 and 10 (got %s)" % (m.reenter_max,))
     _req(0 < m.max_price_gap_pct <= 100, "mirror.max_price_gap_pct must be > 0 and <= 100")
     for k, v in m.units_per_lot_by_symbol.items():
         _req(k in sym.specs, "mirror.units_per_lot_by_symbol: %r has no entry in symbols.specs "

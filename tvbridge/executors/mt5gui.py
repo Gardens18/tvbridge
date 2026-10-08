@@ -987,6 +987,9 @@ class Mt5GuiExecutor(Executor):
         hint = req.price_hint
         if hint is not None and _finite(hint) and float(hint) > 0:
             max_gap = self.cfg.mirror_max_price_gap_pct(req.symbol)
+            override = getattr(req, "max_price_gap_pct", None)
+            if override is not None and _finite(override) and float(override) > 0:
+                max_gap = max(float(max_gap), float(override))
             gap = abs(ref - float(hint)) / float(hint) * 100.0
             if gap > max_gap:
                 return ("PRICE_GAP: the MT5 quote %s / %s is %.2f %% from the alert price %s (mirror."

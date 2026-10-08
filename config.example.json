@@ -203,6 +203,9 @@
     "stop_distance_by_symbol": {},
     "tp_distance_by_symbol": {},
     "quote_usd_by_symbol": {},
+    "reenter_after_stop": false,
+    "reenter_cooldown_s": 60,
+    "reenter_max": 1,
     "max_price_gap_pct_by_symbol": {}
   },
   "notify": {

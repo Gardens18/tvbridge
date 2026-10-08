@@ -200,6 +200,9 @@ class OrderRequest:
     # ``sl``/``tp`` are then only a fallback for executors without a quote of their own.
     sl_distance: Optional[float] = None
     tp_distance: Optional[float] = None
+    # override of mirror.max_price_gap_pct for this order (a re-entry's hint is the stop price of
+    # the position it replaces, not a live alert price); None = the configured value
+    max_price_gap_pct: Optional[float] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
