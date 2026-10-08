@@ -60,7 +60,8 @@
     ],
     "friday_cutoff_server": "22:00",
     "min_hold_s_for_signal_close": 0,
-    "resume_after_verified_fill": false
+    "resume_after_verified_fill": false,
+    "stale_reference_buffer_pct": 0.0
   },
   "symbols": {
     "_comment": "Symbols are keyed by normalized TradingView symbol (OANDA:EURUSD, EUR/USD and EURUSD.h all become EURUSD). The MT5 name is map[symbol] if present, else symbol + suffix. allowed: empty list = every symbol in specs. commission_per_lot_usd in a spec (null = risk.commission_per_lot_usd) is the round-trip commission per 1.00 lot of that symbol.",

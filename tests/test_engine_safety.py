@@ -504,6 +504,31 @@ class RolloverTests(Base):
         plan = risk.plan_entry(self.signal("buy", "x"), self.engine._risk_state(clock.utcnow()), self.cfg)
         self.assertTrue(plan.approved, plan.reason)
 
+    def test_stale_basis_with_a_buffer_keeps_trading_on_a_raised_reference(self):
+        self.build(self.make_cfg(executor={"gui": {"account_poll_s": 15}},
+                                 risk={"stale_reference_buffer_pct": 2.0}))
+        self.at(self.MON, 18, 0)
+        self.engine._poll_account("test")                       # last good read: 50,000
+        self.executor.read_error = ExecutorError("ACCOUNT_UNREADABLE", "screen locked")
+        self.at(self.MON, 23, 30)
+        self.engine._poll_account("test")
+        self.executor.read_error = None
+        self.executor.balance = 51000.0
+        self.at(self.TUE, 0, 0, 15)
+        self.engine._poll_account("test")
+        ds = self.store.get_day_state(self.TUE)
+        self.assertEqual(ds["source"], "stale_buffered")
+        self.assertAlmostEqual(ds["reference"], 51000.0 * 1.02, places=2)
+        self.assertTrue(self.sent("warn", "new server day"))
+        self.assertFalse(self.sent("critical", "new server day"))
+        self.at(self.TUE, 10, 0)
+        self.engine._poll_account("test")
+        plan = risk.plan_entry(self.signal("buy", "x"), self.engine._risk_state(clock.utcnow()), self.cfg)
+        self.assertTrue(plan.approved, plan.reason)
+        # the floors come from the raised reference (tighter than from 51,000)
+        floors = self.engine._risk_state(clock.utcnow()).floors
+        self.assertGreater(floors.entry_floor, risk.compute_floors(51000.0, self.cfg).entry_floor)
+
     def test_stale_basis_without_positions_and_same_balance_is_exact(self):
         self.at(self.MON, 18, 0)
         self.engine._poll_account("test")

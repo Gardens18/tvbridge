@@ -100,6 +100,11 @@ class RiskCfg:
     # entries resume on their own when MT5 shows exactly one new position on that symbol and side with
     # the order's size, a ticket and a stop-loss. False: always wait for `tvbridge resume`.
     resume_after_verified_fill: bool = False
+    # When the engine was down over server midnight (no fresh snapshot near 00:00), today's daily
+    # reference can only be estimated. 0: store it as "stale_estimate" and refuse entries until
+    # `tvbridge set-reference`. > 0: raise the estimate by this many percent as a safety margin
+    # (tighter floors), store it as "stale_buffered" and keep trading; a warning is sent.
+    stale_reference_buffer_pct: float = 0.0
 
 
 @dataclass
@@ -817,6 +822,8 @@ def validate(cfg: Config) -> None:
          "risk: need 0 <= max_buffer_pct (%s) < max_loss_pct (%s)" % (r.max_buffer_pct, r.max_loss_pct))
     _req(r.kill_buffer_pct >= 0, "risk.kill_buffer_pct must be >= 0")
     _req(r.max_total_open_risk_pct > 0, "risk.max_total_open_risk_pct must be > 0")
+    _req(0 <= r.stale_reference_buffer_pct <= 10,
+         "risk.stale_reference_buffer_pct must be between 0 and 10 (got %s)" % (r.stale_reference_buffer_pct,))
     _req(r.max_open_positions >= 1, "risk.max_open_positions must be >= 1 (got %d)" % r.max_open_positions)
     _req(r.max_trades_per_day >= 0, "risk.max_trades_per_day must be >= 0")
     _req(r.max_lots > 0, "risk.max_lots must be > 0")

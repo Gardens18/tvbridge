@@ -1388,11 +1388,6 @@ class Engine:
             if ref is None:
                 log.debug("no data for today's daily reference yet; will retry")
                 return None
-            try:
-                floors = risk.compute_floors(ref, cfg)
-            except ValueError as e:
-                log.error("cannot compute floors for %s: %s", key, e)
-                return None
             snaps = ([last_before] if last_before is not None else []) + list(today_snaps)
             balances = [float(s.balance) for s in snaps if _finite(s.balance)]
             if not have_history:
@@ -1400,6 +1395,18 @@ class Engine:
             equities = [float(s.equity) for s in snaps if _finite(s.equity)]
             ref_balance = max(balances) if balances else ref
             ref_equity = max(equities) if equities else ref_balance
+            buffer_pct = float(getattr(cfg.risk, "stale_reference_buffer_pct", 0.0) or 0.0)
+            if source == "stale_estimate" and buffer_pct > 0:
+                # the true midnight equity may be higher than anything seen: raise the estimate,
+                # which only tightens the floors, and keep trading
+                factor = 1.0 + buffer_pct / 100.0
+                ref, ref_balance, ref_equity = ref * factor, ref_balance * factor, ref_equity * factor
+                source = "stale_buffered"
+            try:
+                floors = risk.compute_floors(ref, cfg)
+            except ValueError as e:
+                log.error("cannot compute floors for %s: %s", key, e)
+                return None
             self.store.set_day_state(today, ref_balance, ref_equity, source)
             self.store.set_kv("day", key)
             self._rolled_once = True
@@ -1421,6 +1428,12 @@ class Engine:
                 level = "critical"
                 msg += (" The basis is stale, so the true reference may be higher: new entries are refused until "
                         "you check the Hantec dashboard and run `tvbridge set-reference VALUE`.")
+            elif source == "stale_buffered":
+                level = "warn"
+                msg += (" The basis is stale (the engine was down over midnight), so the estimate was raised by "
+                        "%.1f %% as a safety margin (risk.stale_reference_buffer_pct) and entries stay allowed. "
+                        "If the prop-firm dashboard shows another value, run `tvbridge set-reference VALUE`."
+                        % buffer_pct)
             prev_ds = self.store.get_day_state(today - timedelta(days=1))
             if prev_ds is not None and _finite(prev_ds.get("reference")) and float(prev_ds["reference"]) > 0:
                 jump = abs(ref - float(prev_ds["reference"])) / float(prev_ds["reference"])
@@ -1445,7 +1458,7 @@ class Engine:
         if (now - midnight).total_seconds() > REFERENCE_REFINE_POLLS * float(cfg.executor.gui.account_poll_s):
             return
         ds = self.store.get_day_state(today)
-        if ds is None or ds.get("source") not in ("rollover", "startup", "stale_estimate"):
+        if ds is None or ds.get("source") not in ("rollover", "startup", "stale_estimate", "stale_buffered"):
             return
         cand = max(float(snap.balance), float(snap.equity))
         if not _finite(ds.get("reference")) or cand <= float(ds["reference"]) + BALANCE_EPS:
