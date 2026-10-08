@@ -849,13 +849,20 @@ class MirrorEngineGuiTests(MirrorEngineBase):
         self.assertEqual(self.fake.order_button_clicks, [])
         self.assertIsNone(self.scale())
 
-    def test_uncertain_entry_halts_and_adopts(self):
+    def test_vanished_ticket_with_the_fill_listed_is_a_normal_entry(self):
         self.start_gui(order_outcome="vanish")
+        row = self.sync("long", 28, price=4177.8)
+        self.assertEqual((row["status"], row["reason"]), ("done", ""), row)
+        self.assertIsNone(self.store.get_kv("halted"))
+        self.assertEqual([(r["side"], r["lots"]) for r in self.ledger()], [("buy", 0.28)])
+        self.assertAlmostEqual(float(self.scale()), 1.0)
+
+    def test_uncertain_entry_halts(self):
+        self.start_gui(order_outcome="vanish_none")
         row = self.sync("long", 28, price=4177.8)
         self.assertEqual(row["status"], "failed")
         self.assertTrue((self.store.get_kv("halted") or "").startswith("UNCERTAIN_EXECUTION"))
-        self.assertEqual([(r["side"], r["lots"]) for r in self.ledger()], [("buy", 0.28)])   # adopted
-        self.assertAlmostEqual(float(self.scale()), 1.0)
+        self.assertEqual(self.ledger(), [])
 
     def test_rehearsal_mode_sends_nothing(self):
         self.start_gui(mode="rehearsal")
