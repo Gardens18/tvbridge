@@ -74,6 +74,8 @@ POLL_INTERVAL_S = 0.1          # window polling interval
 RESULT_POLL_S = 0.5            # result OCR polling interval
 SYMBOL_SETTLE_S = 0.5          # MT5 reloads prices after the symbol changes
 SYMBOL_SELECT_TIMEOUT_S = 3.0  # the order window's title must name the typed symbol within this
+CONFIRM_FILL_TIMEOUT_S = 6.0   # after the ticket vanished without a result: wait this long for the new row
+CONFIRM_FILL_POLL_S = 1.0
 SYMBOLS_WINDOW_TITLE = "Symbols"
 SYMBOLS_SEARCH_OFFSET = (350.0, 78.0)   # search field of MT5's Symbols window (Windows build)
 SYMBOLS_FILTER_SETTLE_S = 3.0           # the Symbols window filters its tree after typing
@@ -502,6 +504,57 @@ class Mt5GuiExecutor(Executor):
         self.driver.click(x, it.cy)
         return self._wait_for_new_window(main.pid, before, gui.order_dialog_title_contains, gui.dialog_timeout_s)
 
+    def _ticket_snapshot(self, main: Any) -> Optional[Set[str]]:
+        """Tickets of the positions MT5 lists right now, or None when the list is not readable
+        (then a vanished ticket can never be confirmed from the list)."""
+        try:
+            rows, issue = self._scan_positions(main, "pre_order")
+        except Exception as e:
+            log.info("Trade list not readable before the order (%s); a vanished ticket will stay uncertain", e)
+            return None
+        if issue or any(not p.ticket for p, _ in rows):
+            return None
+        return {str(p.ticket) for p, _ in rows}
+
+    def _confirm_fill_from_toolbox(self, main: Any, req: OrderRequest, pre_tickets: Optional[Set[str]],
+                                   evidence: List[str]) -> Optional["_Outcome"]:
+        """After the order window vanished without a result: the fill it made, read from the
+        Trade list. Exactly one NEW row (ticket not listed before the click) with the request's
+        symbol, side and lots within CONFIRM_FILL_TIMEOUT_S proves the fill; otherwise None."""
+        if pre_tickets is None:
+            return None
+        want_lots = float(req.lots)
+        start = time.monotonic()
+        waited = 0.0
+        while True:
+            try:
+                rows, issue = self._scan_positions(main, "fill_confirm")
+            except Exception as e:
+                log.info("Trade list not readable while confirming the fill: %s", e)
+                rows, issue = [], str(e)
+            if not issue:
+                new = [p for p, _ in rows
+                       if p.ticket and str(p.ticket) not in pre_tickets
+                       and (p.symbol or "").lower() == (req.symbol or "").lower()
+                       and p.side == req.side and abs(float(p.lots) - want_lots) <= LOTS_EPS]
+                if len(new) == 1:
+                    p = new[0]
+                    if self._scan_pngs:
+                        evidence.append(self._scan_pngs[-1])
+                    msg = "confirmed from the Trade list: %s %s %s #%s at %s" % (
+                        p.side, "%.*f" % (int(req.lot_decimals), float(p.lots)), p.symbol, p.ticket,
+                        p.open_price if p.open_price is not None else "?")
+                    log.info("the order window closed without a result; %s", msg)
+                    return _Outcome("filled", msg, str(p.ticket), p.open_price, text=msg)
+                if len(new) > 1:
+                    log.warning("%d new positions match %s %s %s; cannot tell which is ours",
+                                len(new), req.side, req.lots, req.symbol)
+                    return None
+            if waited >= CONFIRM_FILL_TIMEOUT_S - 1e-9 or time.monotonic() - start >= CONFIRM_FILL_TIMEOUT_S:
+                return None
+            self.driver.sleep(CONFIRM_FILL_POLL_S)
+            waited += CONFIRM_FILL_POLL_S
+
     def _open_checked_dialog(self, main: Any, state: Dict[str, Any]) -> Any:
         """Open the New Order window and check its calibrated size (ExecutorError otherwise)."""
         gui = self.gui
@@ -796,6 +849,7 @@ class Mt5GuiExecutor(Executor):
             raise ExecutorError("MAIN_LAYOUT_CHANGED", "%s; run `tvbridge calibrate`" % issue)
         self._dismiss_stray_dialogs(main)
         self._focus(main)
+        pre_tickets = self._ticket_snapshot(main)       # to recognise our own fill in the Trade list
         dlg = self._open_checked_dialog(main, state)   # 2. incl. layout check
         od = self.calib.order_dialog
         pts = od["points"]
@@ -937,6 +991,12 @@ class Mt5GuiExecutor(Executor):
         state["clicked"] = True
         self.driver.click(bx, by)
         outcome = self._await_result(dlg, baseline, "order_%s_result" % side, evidence)
+        if outcome.vanished:
+            # MT5 sometimes closes the ticket right after a fill without showing its result page
+            # (seen on the Mac build): the Trade list is the proof then.
+            confirmed = self._confirm_fill_from_toolbox(main, req, pre_tickets, evidence)
+            if confirmed is not None:
+                outcome = confirmed
 
         status, message = outcome.status, outcome.message
         if status == "filled":

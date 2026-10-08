@@ -158,13 +158,31 @@ class OpenMarketLiveTests(GuiTestCase):
         self.assertNoDialogs()
         self.assertEvidence(res, 2)
 
-    def test_dialog_vanishes_after_click_is_uncertain(self):
-        ex = self.make(order_outcome="vanish")
+    def test_dialog_vanishes_but_new_position_listed_is_filled(self):
+        ex = self.make(order_outcome="vanish", positions=[pos(111111, symbol="GBPUSD.h")])
+        res = ex.open_market(buy_req())
+        self.assertEqual(res.status, "filled", res.message)
+        self.assertIn("Trade list", res.message)
+        self.assertEqual(res.ticket, "52390671")
+        self.assertAlmostEqual(res.fill_price, 1.08345)
+        self.assertAlmostEqual(res.sl, 1.08)
+        self.assertEqual(self.fake.order_button_clicks, ["buy"])
+        self.assertNoDialogs()
+        self.assertEvidence(res, 2)
+
+    def test_dialog_vanishes_and_nothing_listed_is_uncertain(self):
+        ex = self.make(order_outcome="vanish_none")
         res = ex.open_market(buy_req())
         self.assertEqual(res.status, "uncertain")
         self.assertTrue(res.message.startswith("UNCERTAIN_EXECUTION"), res.message)
         self.assertEqual(self.fake.order_button_clicks, ["buy"])
         self.assertNoDialogs()
+
+    def test_dialog_vanishes_with_unreadable_list_before_the_click_is_uncertain(self):
+        ex = self.make(order_outcome="vanish", positions=[pos(111111)], hidden_tickets=["111111"])
+        # the row hidden before the click makes the pre-order list incomplete (equity mismatch)
+        res = ex.open_market(buy_req())
+        self.assertEqual(res.status, "uncertain", res.message)
 
     def test_no_reaction_is_uncertain_and_never_presses_return(self):
         ex = self.make(order_outcome="nothing")

@@ -618,6 +618,8 @@ class FakeMt5Driver(Driver):
             elif outcome == "vanish":
                 add_position()
                 self._remove_dialog(d)
+            elif outcome == "vanish_none":          # the ticket closes and nothing was opened
+                self._remove_dialog(d)
             elif outcome == "nothing":
                 d.pending = False
             elif outcome == "custom":
