@@ -565,6 +565,9 @@ See [section 14](#14-mirror-mode).
 | `idea_risk_pct` | `0.0` | `> 0`: the stop distance is `account.initial_balance` x this % / the strategy's units (never wider than `stop_distance`), so a bigger size gets a tighter stop. `0` = always `stop_distance`. |
 | `fan_out` | `{}` | Mirror one alert symbol onto several MT5 symbols: `{"XAUUSD": ["XAUUSD", "XAUUSDMICRO"]}`. Key: the alert's symbol; values: `symbols.specs` keys or MT5 names (each needs a spec, no duplicates, at least one). See [mirror fan-out](#mirror-fan-out). |
 | `units_per_lot_by_symbol` | `{}` | Per-symbol override of `units_per_lot`, e.g. `{"XAUUSDMICRO": 10}` for a micro contract of 10 oz per lot (28 oz = 2.80 lots). Each key needs a `symbols.specs` entry; values > 0. |
+| `resync_lockout_min` | `0` | `> 0`: a mirrored position that MT5 closed on its own (its protective stop was hit) while the strategy's newest alert still holds that side is opened again after this many minutes, through the normal entry checks. `0` = off. See [re-sync after a server-side stop](#re-sync-after-a-server-side-stop). |
+| `resync_max_per_trade` | `1` | How many times one strategy trade may be re-synced on one symbol. |
+| `resync_min_loss_frac` | `0.5` | A server-side close counts as a stop-out (and is re-synced) only when the balance fell by at least this fraction of the position's booked risk. A close by hand or at a profit is never re-synced. |
 
 ### notify
 
@@ -774,6 +777,7 @@ reduces can show `CLOSE_FAILED`.
 | `IN_SYNC` (status `done`) | MT5 already matches the strategy's position (within `size_tolerance_lots`) | Normal. |
 | `SUPERSEDED_BY_SYNC` (status `expired`) | A newer sync for the same symbol was already waiting; only the newest one acts | Normal after a busy moment or a restart. |
 | `FANNED_OUT` (status `done`) | The alert's symbol has a `mirror.fan_out` entry: the alert was split into one sync per target symbol (ids `<alert id>@<MT5 symbol>`), which carry the real outcomes | Normal. Look at the child signals in `tvbridge status` / the notifications; each target can succeed or be refused on its own. |
+| `resync_scheduled` / `resync` / `resync_cancelled` / `resync_skipped` / `resync_limit` (events) | A mirrored position was stopped out by the MT5 server while the strategy may still hold it; with `mirror.resync_lockout_min` > 0 it is re-opened after the lockout (see [re-sync](#re-sync-after-a-server-side-stop)) | `resync_limit` means the leg stays flat until the next alert; check whether the stop distance suits the symbol. |
 | `MIRROR_ADD_REFUSED` (status `rejected`) | The strategy's position is larger than MT5's on the same side and `mirror.allow_adds` is false | Expected when the strategy scales in, or when the MT5 position was reduced by hand. Nothing was opened. |
 | `MIRROR_NOT_AN_ENTRY` (status `rejected`) | The alert reports a partial exit (`prev_size` larger than `size`, same side) but MT5 has no position on the symbol (the entry was refused or missed earlier) | Nothing was opened: a partial exit never starts a position. |
 | `POSITIONS_UNKNOWN` (status `failed`) | The MT5 position list could not be read (`TOOLBOX_INCOMPLETE`, `ACCOUNT_UNREADABLE`), so tvbridge cannot tell what to change. A sync to flat still closes what it can see | Critical alert: compare MT5 with the strategy and fix by hand; make the Trade list fully visible. |
@@ -946,3 +950,40 @@ and a micro contract, **each as its own independent position with the strategy's
   half-finished fan-out is completed without duplicating children.
 - A target symbol must not get sync alerts of its own from another strategy.
 - `tvbridge status` lists the targets on the `mirror:` line.
+
+### Re-sync after a server-side stop
+
+Every mirrored position carries its own protective stop on the MT5 server, and that stop is
+not the strategy's stop: it is measured from the MT5 quote of *that* symbol, so spread,
+slippage and, on a fan-out target in another currency (`XAUEUR` for a `XAUUSD` alert), the
+FX move between the two legs can trigger it while the strategy itself is still in the trade.
+Without an alert tvbridge never opens a position, so such a leg stays flat ("orphaned") until
+the strategy's next fill, which may be the exit.
+
+With `resync_lockout_min` > 0 (off by default) tvbridge re-opens it instead:
+
+```json
+"mirror": { "resync_lockout_min": 10, "resync_max_per_trade": 1, "resync_min_loss_frac": 0.5 }
+```
+
+- **Trigger.** A ledger position that came from a sync alert disappears from MT5 and the
+  balance proves a close (`closed_on_server`). It counts as a stop-out only when the balance
+  fell by at least `resync_min_loss_frac` of the position's booked risk; a close by hand or
+  at a profit is logged as `resync_skipped` and nothing happens.
+- **Lockout.** A `RESYNC` is scheduled `resync_lockout_min` minutes later (the strategy's
+  own re-entry lockout is the natural value). It is stored (kv `resync:<symbol>`), survives a
+  restart and shows in `tvbridge status` as a `re-sync:` line.
+- **Check at the end of the lockout.** The strategy's newest stored alert for the symbol's
+  root (the fan-out parent) must still say the same side with a size > 0; otherwise the
+  re-sync is cancelled (`resync_cancelled`). It is also cancelled when that alert or its
+  child is still queued, when the position is open again, when the engine is halted, when
+  the symbol is no longer a mirror target, or when re-sync was switched off meanwhile.
+- **Entry.** A new sync signal `<child id>#r<n>` is queued, built from that alert (its size,
+  its `fan_out` conversion) with the stop-out price as the alert price and the current time as
+  its fire time. It is an ordinary mirror entry: the risk guard (floors, trades per day, open
+  risk, pause/halt), the price-gap check and the stop measured from the ticket's quote all
+  apply, and it books risk like any entry. A later alert supersedes it like any sync.
+- **Limit.** `resync_max_per_trade` re-syncs per strategy trade and symbol; a further
+  stop-out is logged as `resync_limit` (warning) and the leg stays flat until the next alert.
+- A re-sync enters later and usually at a worse price than the strategy's own position,
+  so it adds to the trade's risk: each re-sync is a new entry with its own stop.

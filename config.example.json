@@ -188,7 +188,7 @@
     }
   },
   "mirror": {
-    "_comment": "Mirror mode (action 'sync', see README 'Mirror mode' and tradingview/ALERTS.md). One TradingView strategy alert on every order fill reports the strategy's position; tvbridge makes the MT5 position on that symbol match it. units_per_lot: strategy units per 1.00 MT5 lot (gold: 100 oz). stop_distance: broker-side protective stop in price units, measured from the MT5 ticket's own quote (a safety net; normal exits come from alerts). tp_distance 0 = no take-profit. size_tolerance_lots: differences up to this count as in sync. max_price_gap_pct: an entry is refused when the alert price and the MT5 quote differ by more. allow_adds false: never add to an open position. fan_out: mirror one alert symbol onto several MT5 symbols, each as its own position with the full strategy size, e.g. {\"XAUUSD\": [\"XAUUSD\", \"XAUUSDMICRO\"]} (every target needs a symbols.specs entry; see README 'Mirror fan-out'). units_per_lot_by_symbol: per-symbol override of units_per_lot, e.g. {\"XAUUSDMICRO\": 10} for a 10 oz micro lot. stop_distance_by_symbol / tp_distance_by_symbol: per-symbol overrides of stop_distance / tp_distance, e.g. {\"XAGUSD\": 1.4}.",
+    "_comment": "Mirror mode (action 'sync', see README 'Mirror mode' and tradingview/ALERTS.md). One TradingView strategy alert on every order fill reports the strategy's position; tvbridge makes the MT5 position on that symbol match it. units_per_lot: strategy units per 1.00 MT5 lot (gold: 100 oz). stop_distance: broker-side protective stop in price units, measured from the MT5 ticket's own quote (a safety net; normal exits come from alerts). tp_distance 0 = no take-profit. size_tolerance_lots: differences up to this count as in sync. max_price_gap_pct: an entry is refused when the alert price and the MT5 quote differ by more. allow_adds false: never add to an open position. fan_out: mirror one alert symbol onto several MT5 symbols, each as its own position with the full strategy size, e.g. {\"XAUUSD\": [\"XAUUSD\", \"XAUUSDMICRO\"]} (every target needs a symbols.specs entry; see README 'Mirror fan-out'). units_per_lot_by_symbol: per-symbol override of units_per_lot, e.g. {\"XAUUSDMICRO\": 10} for a 10 oz micro lot. stop_distance_by_symbol / tp_distance_by_symbol: per-symbol overrides of stop_distance / tp_distance, e.g. {\"XAGUSD\": 1.4}. resync_lockout_min: > 0 re-opens a mirrored position that MT5 stopped out on its own while the strategy's newest alert still holds that side, after this many minutes and through the normal entry checks (0 = off; see README 'Re-sync after a server-side stop'); resync_max_per_trade: re-syncs allowed per strategy trade and symbol; resync_min_loss_frac: a server-side close counts as a stop-out only when the balance fell by at least this fraction of the position's booked risk.",
     "enabled": false,
     "units_per_lot": 100.0,
     "stop_distance": 8.5,
@@ -202,7 +202,10 @@
     "stop_distance_by_symbol": {},
     "tp_distance_by_symbol": {},
     "quote_usd_by_symbol": {},
-    "max_price_gap_pct_by_symbol": {}
+    "max_price_gap_pct_by_symbol": {},
+    "resync_lockout_min": 0.0,
+    "resync_max_per_trade": 1,
+    "resync_min_loss_frac": 0.5
   },
   "notify": {
     "_comment": "Notification channels. macos uses Notification Center; ntfy_url e.g. https://ntfy.sh/<your-topic>; Telegram needs both bot token and chat id. min_level: debug | info | warn | critical.",

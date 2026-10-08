@@ -199,6 +199,16 @@ class MirrorCfg:
     quote_usd_by_symbol: Dict[str, float] = field(default_factory=dict)
     # per-symbol override of max_price_gap_pct (wider for symbols converted with quote_usd_by_symbol)
     max_price_gap_pct_by_symbol: Dict[str, float] = field(default_factory=dict)
+    # Re-sync after a server-side stop: when MT5 closes a mirrored position on its own (its
+    # protective stop was hit) while the strategy's newest alert still holds that side, the
+    # position is opened again after this many minutes through the normal entry checks.
+    # 0 = off (an orphaned leg stays flat until the next alert).
+    resync_lockout_min: float = 0.0
+    # how many times one strategy trade may be re-synced on one symbol (each re-sync is a new entry)
+    resync_max_per_trade: int = 1
+    # a server-side close counts as a stop-out (and is re-synced) only when the balance fell by at
+    # least this fraction of the position's booked risk; a close by hand or at a profit is not
+    resync_min_loss_frac: float = 0.5
 
 
 @dataclass
@@ -879,6 +889,11 @@ def validate(cfg: Config) -> None:
     _req(m.tp_distance >= 0, "mirror.tp_distance must be >= 0 (0 = no take-profit)")
     _req(m.size_tolerance_lots >= 0, "mirror.size_tolerance_lots must be >= 0")
     _req(0 < m.max_price_gap_pct <= 100, "mirror.max_price_gap_pct must be > 0 and <= 100")
+    _req(m.resync_lockout_min >= 0, "mirror.resync_lockout_min must be >= 0 (0 = off; got %s)"
+         % m.resync_lockout_min)
+    _req(m.resync_max_per_trade >= 1, "mirror.resync_max_per_trade must be >= 1 (got %s)" % m.resync_max_per_trade)
+    _req(0 < m.resync_min_loss_frac <= 1, "mirror.resync_min_loss_frac must be > 0 and <= 1 (got %s)"
+         % m.resync_min_loss_frac)
     for k, v in m.units_per_lot_by_symbol.items():
         _req(k in sym.specs, "mirror.units_per_lot_by_symbol: %r has no entry in symbols.specs "
                              "(use a symbols.specs key or its MT5 name)" % k)

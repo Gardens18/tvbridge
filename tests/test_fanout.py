@@ -7,6 +7,7 @@ Paper engine for the engine behaviour; the GUI part uses FakeMt5Driver only (nev
 import dataclasses
 import logging
 import tempfile
+import time
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -16,7 +17,7 @@ from tests.test_engine import SECRET, T0
 from tests.test_mirror import MirrorEngineBase
 from tvbridge import cli, clock, risk, signals
 from tvbridge.config import ConfigError, config_from_dict, deep_merge
-from tvbridge.engine import FAN_OUT_PARENT, build_status
+from tvbridge.engine import FAN_OUT_PARENT, RESYNC_N, RESYNC_OF, RESYNC_ROOT, build_status
 from tvbridge.executors.mt5gui import Mt5GuiExecutor
 from tvbridge.executors.paper import PaperExecutor
 from tvbridge.gui import parse
@@ -470,3 +471,221 @@ class FanOutGuiTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ResyncTests(MirrorEngineBase):
+    """mirror.resync_lockout_min: a fan-out leg MT5 stopped out while the strategy still holds the
+    trade is opened again after the lockout (paper engine; the micro leg is the one that stops)."""
+
+    RISK = FanOutEngineTests.RISK
+    RESYNC = {"resync_lockout_min": 10, "resync_max_per_trade": 1}
+    fan_cfg = FanOutEngineTests.fan_cfg
+    pos = FanOutEngineTests.pos
+    children = FanOutEngineTests.children
+
+    def resync_cfg(self, mirror=None, **sections):
+        m = dict(self.RESYNC)
+        m.update(mirror or {})
+        return self.fan_cfg(mirror=m, **sections)
+
+    def poll(self, n=2):
+        """``n`` account reads (RECONCILE_MISSES reads prove a server-side close)."""
+        for _ in range(n):
+            self.assertTrue(self.engine.request_account_poll())
+            self.assertTrue(self.engine.wait_idle(10))
+
+    def stop_out_micro(self):
+        """Move the paper micro market through the long's stop: MT5 closes it, gold stays open."""
+        self.executor.set_price_hint(MICRO, 4160.0)
+        self.poll()
+        self.assertEqual(self.pos(MICRO), [])
+        self.assertEqual(self.pos(GOLD), [("buy", 0.12)])
+        closed = [r for r in self.all_ledger() if r["symbol"] == MICRO and r["status"] == "closed"]
+        self.assertEqual([r["close_reason"] for r in closed], ["closed_on_server"])
+        return closed[0]
+
+    def pending(self):
+        return build_status(self.cfg, self.store)["resync_pending"]
+
+    def wait_resync_done(self, sig_id):
+        self.wait_for(lambda: (self.row(sig_id) or {}).get("status") not in (None, "queued", "processing"),
+                      msg="re-sync %s did not run" % sig_id)
+        return self.row(sig_id)
+
+    def test_stopped_out_leg_is_reopened_after_the_lockout(self):
+        self.start(self.resync_cfg())
+        parent = self.sync("long", 28)
+        row = self.stop_out_micro()
+        # scheduled: stored, visible in the status, nothing opened yet
+        self.assertEqual(len(self.events("resync_scheduled")), 1)
+        pend = self.pending()
+        self.assertEqual([(p["symbol"], p["side"], p["n"], p["price"]) for p in pend], [(MICRO, "buy", 1, row["sl"])])
+        self.assertEqual(pend[0]["not_before"], clock.iso(self.now + timedelta(minutes=10)))
+        self.assertEqual(pend[0]["root"], parent["id"])
+        self.assertEqual(self.pos(MICRO), [])
+        self.tick(5 * 60)
+        time.sleep(0.2)
+        self.assertEqual(self.pos(MICRO), [])             # the lockout is not over
+        # the lockout ends: a new sync entry built from the newest alert opens the leg again
+        self.tick(5 * 60 + 1)
+        rid = "%s@%s#r1" % (parent["id"], MICRO)
+        res = self.wait_resync_done(rid)
+        self.assertEqual((res["status"], res["reason"]), ("done", ""))
+        self.assertEqual(res["payload"]["raw"][FAN_OUT_PARENT], parent["id"])
+        self.assertEqual((res["payload"]["raw"][RESYNC_ROOT], res["payload"]["raw"][RESYNC_N]), (parent["id"], 1))
+        self.assertEqual(res["payload"]["raw"][RESYNC_OF], row["signal_id"])
+        self.assertEqual((res["payload"]["price"], res["payload"]["fired_at"]), (row["sl"], clock.iso(self.now)))
+        self.assertEqual((res["payload"]["target_side"], res["payload"]["target_units"]), ("buy", 28.0))
+        self.assertEqual(self.pos(MICRO), [("buy", 1.26)])      # sized on the balance after the loss
+        self.assertEqual(self.pos(GOLD), [("buy", 0.12)])
+        led = {r["symbol"]: r for r in self.ledger()}
+        self.assertEqual(led[MICRO]["signal_id"], rid)
+        self.assertEqual(self.pending(), [])
+        self.assertEqual(len(self.events("resync")), 1)
+        self.assertEqual(self.store.kv_with_prefix("resync:"), {})
+        # the strategy exits: both legs close, the re-synced one too
+        flat = self.sync("flat", 0, order_id="Exit", prev_position="long", prev_size=28)
+        gold, micro = self.children(flat["id"])
+        self.assertEqual((gold["status"], micro["status"]), ("done", "done"))
+        self.assertEqual(self.paper_positions(), [])
+        self.assertEqual(self.ledger(), [])
+
+    def test_second_stop_out_is_not_resynced(self):
+        self.start(self.resync_cfg())
+        parent = self.sync("long", 28)
+        self.stop_out_micro()
+        self.tick(10 * 60 + 1)
+        rid = "%s@%s#r1" % (parent["id"], MICRO)
+        self.assertEqual(self.wait_resync_done(rid)["status"], "done")
+        self.assertEqual(self.pos(MICRO), [("buy", 1.26)])
+        # stopped out again: the limit (1 per trade) is reached
+        self.executor.set_price_hint(MICRO, 4150.0)
+        self.poll()
+        self.assertEqual(self.pos(MICRO), [])
+        self.assertEqual(len(self.events("resync_limit")), 1)
+        self.assertEqual(len(self.events("resync_scheduled")), 1)
+        self.assertEqual(self.pending(), [])
+        self.assertTrue(any("not re-synced" in m for m in self.notes("warn")))
+
+    def test_cancelled_when_the_strategy_left_the_trade(self):
+        self.start(self.resync_cfg())
+        parent = self.sync("long", 28)
+        self.stop_out_micro()
+        self.assertEqual(len(self.pending()), 1)
+        # the strategy exits during the lockout: gold closes, the micro is already flat
+        self.tick(60)
+        flat = self.sync("flat", 0, order_id="Exit", prev_position="long", prev_size=28)
+        gold, micro = self.children(flat["id"])
+        self.assertEqual((gold["status"], micro["status"]), ("done", "done"))
+        self.assertTrue(micro["reason"].startswith("IN_SYNC"), micro["reason"])
+        self.tick(10 * 60)
+        self.wait_for(lambda: self.events("resync_cancelled"), msg="re-sync not cancelled")
+        self.assertIn("says flat, not long", self.events("resync_cancelled")[0]["message"])
+        self.assertEqual(self.paper_positions(), [])
+        self.assertIsNone(self.row("%s@%s#r1" % (parent["id"], MICRO)))
+        self.assertEqual(self.pending(), [])
+
+    def test_reversal_during_the_lockout_cancels_too(self):
+        self.start(self.resync_cfg())
+        self.sync("long", 28)
+        self.stop_out_micro()
+        self.tick(60)
+        short = self.sync("short", 28, price=4160.0, order_id="Short", prev_position="long", prev_size=28)
+        gold, micro = self.children(short["id"])
+        self.assertEqual((gold["status"], micro["status"]), ("done", "done"))
+        self.assertEqual(self.pos(MICRO), [("sell", 1.26)])
+        self.tick(10 * 60)
+        self.wait_for(lambda: self.events("resync_cancelled"), msg="re-sync not cancelled")
+        self.assertIn("says short, not long", self.events("resync_cancelled")[0]["message"])
+        self.assertEqual(self.pos(MICRO), [("sell", 1.26)])    # untouched
+        self.assertEqual(len(self.ledger()), 2)
+
+    def test_partial_exit_during_the_lockout_resyncs_the_smaller_size(self):
+        self.start(self.resync_cfg())
+        parent = self.sync("long", 28)
+        self.stop_out_micro()
+        self.tick(60)
+        part = self.sync("long", 19.6, order_id="TP", prev_position="long", prev_size=28)
+        gold, micro = self.children(part["id"])
+        self.assertEqual(gold["status"], "done")
+        self.assertEqual(micro["status"], "rejected")          # MIRROR_NOT_AN_ENTRY: a partial exit on a flat leg
+        self.tick(10 * 60)
+        rid = "%s@%s#r1" % (part["id"], MICRO)                 # built from the NEWEST alert, not the first
+        res = self.wait_resync_done(rid)
+        self.assertEqual((res["status"], res["reason"]), ("done", ""))
+        self.assertEqual(res["payload"]["target_units"], 19.6)
+        self.assertEqual(res["result"]["plan"]["details"]["mirror"]["wanted_lots"], 1.96)
+        self.assertEqual(self.pos(MICRO), [("buy", 1.26)])      # 1.96 wanted, capped by the risk guard
+        self.assertIsNone(self.row("%s@%s#r1" % (parent["id"], MICRO)))
+
+    def test_close_at_a_profit_is_not_a_stop_out(self):
+        self.start(self.resync_cfg(mirror={"tp_distance": 12.0}))
+        self.sync("long", 28)
+        self.executor.set_price_hint(MICRO, 4190.0)           # take-profit hit
+        self.poll()
+        self.assertEqual(self.pos(MICRO), [])
+        self.assertEqual(len(self.events("resync_skipped")), 1)
+        self.assertIn("not a stop-out", self.events("resync_skipped")[0]["message"])
+        self.assertEqual(self.pending(), [])
+        self.assertEqual(self.events("resync_scheduled"), [])
+
+    def test_off_by_default(self):
+        self.start(self.fan_cfg())
+        self.assertEqual(self.cfg.mirror.resync_lockout_min, 0.0)
+        self.sync("long", 28)
+        self.stop_out_micro()
+        self.assertEqual(self.pending(), [])
+        self.assertEqual(self.events("resync_scheduled"), [])
+        self.tick(11 * 60)
+        time.sleep(0.2)
+        self.assertEqual(self.pos(MICRO), [])
+
+    def test_pending_resync_survives_a_restart(self):
+        self.start(self.resync_cfg())
+        parent = self.sync("long", 28)
+        self.stop_out_micro()
+        self.assertEqual(len(self.pending()), 1)
+        self.engine.stop(timeout=5)
+        self.tick(3 * 60)
+        self.build(self.cfg)
+        self.engine.start()
+        self.assertTrue(self.engine.wait_idle(15))
+        self.assertEqual(len(self.pending()), 1)              # still pending, not run early
+        self.assertEqual(self.pos(MICRO), [])
+        self.tick(7 * 60 + 1)
+        rid = "%s@%s#r1" % (parent["id"], MICRO)
+        self.assertEqual(self.wait_resync_done(rid)["status"], "done")
+        self.assertEqual(self.pos(MICRO), [("buy", 1.26)])
+        self.assertEqual(self.pending(), [])
+
+    def test_resync_goes_through_the_risk_guard(self):
+        self.start(self.resync_cfg())
+        parent = self.sync("long", 28)
+        self.stop_out_micro()
+        self.store.set_kv("paused", "1")
+        self.store.set_kv("pause_reason", "test")
+        self.tick(10 * 60 + 1)
+        rid = "%s@%s#r1" % (parent["id"], MICRO)
+        res = self.wait_resync_done(rid)
+        self.assertEqual(res["status"], "rejected")
+        self.assertIn("PAUSED", res["reason"])
+        self.assertEqual(self.pos(MICRO), [])
+        self.assertEqual(self.pending(), [])                   # not retried
+
+    def test_status_lines(self):
+        self.start(self.resync_cfg())
+        self.sync("long", 28)
+        self.stop_out_micro()
+        text = cli._format_status(self.engine.status())
+        self.assertIn("re-sync a stopped-out leg after 10 min (max 1 per trade)", text)
+        self.assertIn("re-sync:     buy %s pending" % MICRO, text)
+
+    def test_config_validation(self):
+        with self.assertRaises(ConfigError):
+            self.fan_cfg(mirror={"resync_lockout_min": -1})
+        with self.assertRaises(ConfigError):
+            self.fan_cfg(mirror={"resync_max_per_trade": 0})
+        with self.assertRaises(ConfigError):
+            self.fan_cfg(mirror={"resync_min_loss_frac": 0})
+        cfg = self.fan_cfg(mirror={"resync_lockout_min": 2.5, "resync_min_loss_frac": 1})
+        self.assertEqual((cfg.mirror.resync_lockout_min, cfg.mirror.resync_max_per_trade), (2.5, 1))

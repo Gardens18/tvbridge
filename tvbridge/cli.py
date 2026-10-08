@@ -780,11 +780,17 @@ def _format_status(st: Dict[str, Any]) -> str:
         fan_txt = "".join("; fan-out %s -> %s" % (k, ", ".join(
             "%s (%s units per lot)" % (t.get("symbol"), t.get("units_per_lot")) for t in targets))
             for k, targets in sorted(fan.items()))
-        out.append("mirror:      enabled (%s units per lot, stop %s from the MT5 quote%s)%s%s" % (
+        lock = mirror.get("resync_lockout_min") or 0
+        out.append("mirror:      enabled (%s units per lot, stop %s from the MT5 quote%s)%s%s%s" % (
             mirror.get("units_per_lot"), mirror.get("stop_distance"),
             ", adds allowed" if mirror.get("allow_adds") else "",
             "; scale " + ", ".join("%s %.3f" % (k, v) for k, v in sorted(scales.items())) if scales else "",
-            fan_txt))
+            fan_txt,
+            "; re-sync a stopped-out leg after %g min (max %s per trade)" % (lock, mirror.get("resync_max_per_trade"))
+            if lock else ""))
+        for r in st.get("resync_pending") or []:
+            out.append("re-sync:     %s %s pending, not before %s (stopped out at %s, re-sync %s)" % (
+                r.get("side"), r.get("symbol"), r.get("not_before"), r.get("price"), r.get("n")))
     else:
         out.append("mirror:      off (sync alerts are refused: MIRROR_DISABLED)")
     pending = st.get("pending_signals") or []

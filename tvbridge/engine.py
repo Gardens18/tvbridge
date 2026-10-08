@@ -54,7 +54,8 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
 from . import __version__, clock, risk
 from .config import Config
 from .executors.base import Executor, ExecutorError
-from .models import AccountSnapshot, ObservedPosition, OrderRequest, OrderResult, Signal, TradePlan, opposite_side
+from .models import (SIDES, AccountSnapshot, ObservedPosition, OrderRequest, OrderResult, Signal, TradePlan,
+                     opposite_side)
 from .server import EXIT_MAX_AGE_S, WebhookServer
 
 log = logging.getLogger("tvbridge.engine")
@@ -66,12 +67,20 @@ CLOSE = "CLOSE"            # a close signal
 OPEN = "OPEN"              # a buy/sell signal
 ACCOUNT = "ACCOUNT"        # account poll
 SYNC = "SYNC"              # a mirror-mode sync signal (may carry an exit: same priority as CLOSE)
-PRIORITIES = {FLATTEN: 0, CLOSE_ALL: 0, CLOSE: 1, SYNC: 1, OPEN: 2, ACCOUNT: 3}
+RESYNC = "RESYNC"          # re-open a mirrored position MT5 stopped out (mirror.resync_lockout_min)
+PRIORITIES = {FLATTEN: 0, CLOSE_ALL: 0, CLOSE: 1, SYNC: 1, OPEN: 2, RESYNC: 2, ACCOUNT: 3}
 _KIND_FOR_ACTION = {"buy": OPEN, "sell": OPEN, "close": CLOSE, "close_all": CLOSE_ALL, "sync": SYNC}
 #: kv "mirror_scale:<TV symbol>": opened lots / requested lots of the mirrored position
 MIRROR_SCALE_PREFIX = "mirror_scale:"
 #: Signal.raw key of a fan-out child (value: the parent signal's id); a child never fans out again
 FAN_OUT_PARENT = "fan_out_parent"
+#: Signal.raw keys of a re-sync entry (see Engine._do_resync): the sync signal it was built from,
+#: the ledger row's signal it replaces and its number within the strategy trade (1 = first)
+RESYNC_ROOT = "resync_root"
+RESYNC_OF = "resync_of"
+RESYNC_N = "resync_n"
+#: kv "resync:<MT5 symbol>": a pending re-sync (JSON), so it survives a restart
+RESYNC_PREFIX = "resync:"
 LOTS_EPS = 1e-9
 
 ACCOUNT_REFRESH_S = 5.0        # an entry re-reads the account if the last read is older than this
@@ -94,7 +103,8 @@ REFERENCE_JUMP_WARN_REL = 0.05 # warn when the reference moves this much from th
 PENDING_ADOPTION_S = 600.0     # an uncertain entry's position is adopted when it appears within this
 # longest legitimate task: GUI closes of several positions (with dialog and result timeouts) and an
 # entry with its reversal close can take minutes; an account poll never does
-STALL_LIMITS_S = {"FLATTEN": 300.0, "CLOSE_ALL": 300.0, "CLOSE": 300.0, "OPEN": 300.0, "SYNC": 300.0}
+STALL_LIMITS_S = {"FLATTEN": 300.0, "CLOSE_ALL": 300.0, "CLOSE": 300.0, "OPEN": 300.0, "SYNC": 300.0,
+                  "RESYNC": 300.0}
 STALL_DEFAULT_S = 180.0
 DB_ERROR_NOTIFY_S = 600.0      # database-write failure notifications at most every 10 minutes
 POSITIONS_UNKNOWN_WARN = 4     # reads in a row with an unverifiable position list before a warning
@@ -112,13 +122,16 @@ _DAY_DIR_RE = re.compile(r"^\d{8}$")
 class Task:
     """One unit of work for the executor thread."""
 
-    kind: str                                  # FLATTEN | CLOSE_ALL | CLOSE | SYNC | OPEN | ACCOUNT
+    kind: str                                  # FLATTEN | CLOSE_ALL | CLOSE | SYNC | OPEN | RESYNC | ACCOUNT
     signal: Optional[Signal] = None
     not_before: Optional[datetime] = None      # run no earlier than this (UTC)
     reason: str = ""
+    data: Optional[Dict[str, Any]] = None      # RESYNC: the pending re-sync (see Engine._schedule_resync)
 
     def describe(self) -> str:
         if self.signal is None:
+            if self.kind == RESYNC and self.data:
+                return "%s %s (%s)" % (self.kind, self.data.get("symbol"), self.reason or "after a server-side stop")
             return "%s (%s)" % (self.kind, self.reason) if self.reason else self.kind
         s = self.signal
         return "%s %s %s%s [%s]" % (self.kind, s.action, s.symbol or "*",
@@ -273,6 +286,14 @@ def build_status(cfg: Config, store: Any, now: Optional[datetime] = None) -> Dic
     paused = (store.get_kv("paused") or "") not in ("", "0")
     halted = store.get_kv("halted") or ""
     pending = store.signals_with_status(["queued", "processing"])
+    resyncs = []  # type: List[Dict[str, Any]]
+    for _key, raw in sorted(store.kv_with_prefix(RESYNC_PREFIX).items()):
+        try:
+            data = json.loads(raw)
+        except (TypeError, ValueError):
+            continue
+        if isinstance(data, dict):
+            resyncs.append(data)
     return {
         "now": clock.iso(now),
         "server_time": server_now.strftime("%a %Y-%m-%d %H:%M:%S"),
@@ -304,10 +325,13 @@ def build_status(cfg: Config, store: Any, now: Optional[datetime] = None) -> Dic
                    "tp_distance_by_symbol": dict(cfg.mirror.tp_distance_by_symbol),
                    "allow_adds": bool(cfg.mirror.allow_adds), "scales": mirror_scales(store),
                    "fan_out": {k: [{"symbol": cfg.mt5_symbol(t), "units_per_lot": cfg.mirror_units_per_lot(t)}
-                                   for t in v] for k, v in cfg.mirror.fan_out.items()}},
+                                   for t in v] for k, v in cfg.mirror.fan_out.items()},
+                   "resync_lockout_min": cfg.mirror.resync_lockout_min,
+                   "resync_max_per_trade": cfg.mirror.resync_max_per_trade},
+        "resync_pending": resyncs,
         "pending_signals": [{"id": r.get("id"), "action": r.get("action"), "symbol": r.get("symbol"),
                              "status": r.get("status"), "reason": r.get("reason")} for r in pending],
-        "queue_size": len(pending),
+        "queue_size": len(pending) + len(resyncs),
     }
 
 
@@ -626,6 +650,8 @@ class Engine:
                 with self._lock:
                     self._flatten_pending = False
                 self._do_close_all(task)
+            elif task.kind == RESYNC:
+                self._do_resync(task)
             elif sig is None:
                 log.error("task %s has no signal", task.kind)
             elif not self._claim(sig):
@@ -799,6 +825,17 @@ class Engine:
             resubmitted += 1
         if resubmitted:
             log.info("re-submitted %d queued signal(s) from before the restart", resubmitted)
+        for key, raw in self.store.kv_with_prefix(RESYNC_PREFIX).items():
+            try:
+                data = json.loads(raw)
+                not_before = clock.from_iso(data["not_before"])
+            except (TypeError, ValueError, KeyError):
+                log.error("dropping an unreadable pending re-sync %s: %r", key, raw)
+                self.store.set_kv(key, None)
+                continue
+            self._put(Task(RESYNC, not_before=not_before, reason="restart", data=data))
+            log.info("re-scheduled the pending re-sync of %s (not before %s)", data.get("symbol"),
+                     data.get("not_before"))
 
     # ------------------------------------------------------------------ account polling
 
@@ -979,13 +1016,17 @@ class Engine:
             if proof:
                 self.store.close_ledger_position(pid, "closed_on_server", now)
                 counts.pop(pid, None)
-                self._seen_basis.pop(pid, None)
+                basis = self._seen_basis.pop(pid, None) or self._open_basis.get(pid) or self._basis_fallback
                 self._uncertain_rows.pop(pid, None)
                 msg = ("%s is no longer shown in MT5 (SL/TP hit or closed by hand; %s); ledger position closed"
                        % (desc, proof))
                 log.info(msg)
                 self._event("info", "closed_on_server", msg, {"pid": pid, "signal_id": row.get("signal_id")})
                 self._notify("tvbridge: position closed on server", msg, "info")
+                try:
+                    self._schedule_resync(row, basis, snap, now)
+                except Exception as e:
+                    self._db_error("scheduling a re-sync", e)
             elif pid not in self._uncertain_rows:
                 self._uncertain_rows[pid] = {"desc": desc, "since": now}
                 msg = ("%s is not visible in MT5 but the balance did not change, so it may still be open. Its "
@@ -2298,6 +2339,183 @@ class Engine:
             scale = min(1.0, (cur_lots + done) / float(full_lots))
             self.store.set_kv(MIRROR_SCALE_PREFIX + self._sym_key(sig.symbol), repr(scale))
         self._entry_result(entry, plan, req, res)
+
+    # ------------------------------------------------------------------ re-sync after a server-side stop
+
+    @staticmethod
+    def _resync_root_of(sig: Optional[Signal]) -> Optional[str]:
+        """The id of the sync alert a mirrored position descends from (a fan-out child's parent,
+        a re-sync's root), or the signal's own id; None for a non-sync signal."""
+        if sig is None or sig.action != "sync":
+            return None
+        raw = sig.raw or {}
+        return str(raw.get(RESYNC_ROOT) or raw.get(FAN_OUT_PARENT) or sig.id)
+
+    def _schedule_resync(self, row: Dict[str, Any], basis: Optional[Tuple[float, Optional[float]]],
+                         snap: AccountSnapshot, now: datetime) -> bool:
+        """After a server-side close of ledger ``row``: when mirror.resync_lockout_min is set, the row
+        came from a sync alert, the balance fell by at least resync_min_loss_frac of its booked
+        risk (a stop-out, not a close by hand) and the trade's re-sync count is below
+        resync_max_per_trade, queue a RESYNC for the symbol at the end of the lockout. The
+        strategy's position is checked again when it runs (see _do_resync)."""
+        m = self.cfg.mirror
+        if not m.enabled or float(m.resync_lockout_min) <= 0:
+            return False
+        symbol = str(row.get("symbol") or "")
+        side = str(row.get("side") or "")
+        sig = self.store.load_signal(str(row.get("signal_id") or "")) if row.get("signal_id") else None
+        root = self._resync_root_of(sig)
+        if sig is None or root is None or side not in SIDES or not symbol:
+            return False
+        desc = "%s %s %s (ledger #%s)" % (side, row.get("lots"), symbol, row.get("pid"))
+        risk_usd = float(row.get("risk_usd") or 0.0) if _finite(row.get("risk_usd")) else 0.0
+        loss = (float(basis[0]) - float(snap.balance)) if basis is not None and _finite(snap.balance) else None
+        if risk_usd <= 0 or loss is None or loss < risk_usd * float(m.resync_min_loss_frac):
+            why = ("the balance change (%s) is below %s %% of its booked risk %s: not a stop-out"
+                   % (_money(loss) if loss is not None else "unknown", round(float(m.resync_min_loss_frac) * 100),
+                      _money(risk_usd)))
+            log.info("no re-sync of %s: %s", desc, why)
+            self._event("info", "resync_skipped", "no re-sync of %s: %s" % (desc, why), {"pid": row.get("pid")})
+            return False
+        n = int(float((sig.raw or {}).get(RESYNC_N) or 0)) + 1
+        if n > int(m.resync_max_per_trade):
+            msg = ("%s was stopped out again; it is not re-synced (mirror.resync_max_per_trade=%s reached). It "
+                   "stays flat until the strategy's next alert." % (desc, m.resync_max_per_trade))
+            log.warning(msg)
+            self._event("warn", "resync_limit", msg, {"pid": row.get("pid"), "root": root})
+            self._notify("tvbridge: leg not re-synced (limit)", msg, "warn")
+            return False
+        key = RESYNC_PREFIX + symbol
+        if self.store.get_kv(key) is not None:
+            log.info("a re-sync of %s is already pending", symbol)
+            return False
+        not_before = now + timedelta(minutes=float(m.resync_lockout_min))
+        data = {"symbol": symbol, "side": side, "root": root, "of": sig.id, "n": n, "pid": row.get("pid"),
+                "price": row.get("sl"), "scheduled_at": clock.iso(now), "not_before": clock.iso(not_before)}
+        self.store.set_kv(key, json.dumps(data))
+        self._put(Task(RESYNC, not_before=not_before, reason="stop-out", data=data))
+        msg = ("%s was stopped out while the strategy may still hold it (loss %s); it is re-synced at %s "
+               "(lockout %s min) if the strategy's newest alert still says %s, through the normal entry checks"
+               % (desc, _money(loss), clock.iso(not_before), m.resync_lockout_min,
+                  "long" if side == "buy" else "short"))
+        log.info(msg)
+        self._event("info", "resync_scheduled", msg, dict(data))
+        self._notify("tvbridge: re-sync scheduled", msg, "info")
+        return True
+
+    def _newest_sync_from(self, root_id: str) -> Optional[Dict[str, Any]]:
+        """The newest sync alert on ``root_id``'s symbol (the alert itself if nothing newer is stored),
+        skipping fan-out children and re-syncs so a parent alert is returned; None if unknown."""
+        row = self.store.get_signal_row(root_id)
+        seen = set()  # type: Set[str]
+        while row is not None and row["id"] not in seen:
+            seen.add(row["id"])
+            newer = self.store.newer_sync_signal(row["id"], row["id"] + "@")
+            if newer is None:
+                return row
+            payload = newer.get("payload") if isinstance(newer.get("payload"), dict) else {}
+            raw = payload.get("raw") if isinstance(payload.get("raw"), dict) else {}
+            parent = raw.get(RESYNC_ROOT) or raw.get(FAN_OUT_PARENT)
+            if parent:
+                # a child/re-sync of another alert: continue from that alert
+                prow = self.store.get_signal_row(str(parent))
+                if prow is None:
+                    return newer
+                if prow["id"] in seen:
+                    return prow
+                newer = prow
+            row = newer
+        return row
+
+    def _resync_cancel(self, data: Dict[str, Any], why: str) -> None:
+        msg = "re-sync of %s %s cancelled: %s" % (data.get("side"), data.get("symbol"), why)
+        log.info(msg)
+        self._event("info", "resync_cancelled", msg, dict(data))
+
+    def _do_resync(self, task: Task) -> None:
+        """At the end of the lockout: build a sync entry from the strategy's newest alert and queue it
+        as a normal SYNC (risk guard, price-gap check and stop from the quote apply), unless the
+        strategy has left the trade, a newer alert is still being processed, the position is open
+        again, or the configuration changed."""
+        data = task.data or {}
+        symbol = str(data.get("symbol") or "")
+        side = str(data.get("side") or "")
+        key = RESYNC_PREFIX + symbol
+        self.store.set_kv(key, None)
+        m = self.cfg.mirror
+        if not m.enabled or float(m.resync_lockout_min) <= 0:
+            self._resync_cancel(data, "re-sync is off (mirror.resync_lockout_min)")
+            return
+        if self.store.get_kv("halted") or "":
+            self._resync_cancel(data, "the engine is halted")
+            return
+        newest = self._newest_sync_from(str(data.get("root") or ""))
+        if newest is None:
+            self._resync_cancel(data, "the alert it came from is unknown")
+            return
+        if newest.get("status") in ("queued", "processing"):
+            self._resync_cancel(data, "the strategy's newest alert %s is still being processed; it decides"
+                                % newest["id"])
+            return
+        try:
+            root = Signal.from_dict(newest["payload"]) if isinstance(newest.get("payload"), dict) else None
+        except (KeyError, TypeError, ValueError):
+            root = None
+        if root is None or root.action != "sync":
+            self._resync_cancel(data, "the strategy's newest alert %s is unreadable" % newest.get("id"))
+            return
+        if root.target_side != side or not (_finite(root.target_units) and float(root.target_units) > 0):
+            self._resync_cancel(data, "the strategy's newest alert %s says %s, not %s" % (
+                root.id, "flat" if root.target_side is None else ("long" if root.target_side == "buy" else "short"),
+                "long" if side == "buy" else "short"))
+            return
+        children = self._fan_out_children(root)
+        template = None  # type: Optional[Signal]
+        for c in children:
+            if self._sym_key(c.symbol) == self._sym_key(symbol):
+                template = c
+                break
+        if template is None and not children and self._sym_key(root.symbol) == self._sym_key(symbol):
+            template = root
+        if template is None:
+            self._resync_cancel(data, "%s is no longer a mirror target of %s" % (symbol, root.tv_symbol or root.symbol))
+            return
+        crow = self.store.get_signal_row(template.id)
+        if crow is not None and crow.get("status") in ("queued", "processing"):
+            self._resync_cancel(data, "sync %s is still being processed; it decides" % template.id)
+            return
+        for r in self.store.open_ledger_positions():
+            if self._sym_key(r.get("symbol")) == self._sym_key(symbol):
+                self._resync_cancel(data, "%s is open again (%s %s, ledger #%s)" % (
+                    symbol, r.get("side"), r.get("lots"), r.get("pid")))
+                return
+        n = int(data.get("n") or 1)
+        now = clock.utcnow()
+        price = data.get("price")
+        if not (_finite(price) and float(price) > 0):   # type: ignore[arg-type]
+            price = template.price
+        raw = dict(template.raw or {})
+        raw[RESYNC_ROOT] = root.id
+        raw[RESYNC_OF] = str(data.get("of") or "")
+        raw[RESYNC_N] = n
+        # a re-sync opens from flat: the alert's "previous position" must not read as a partial exit
+        raw["prev_position"] = "flat"
+        raw["prev_size"] = 0
+        raw.pop("prev_market_position", None)
+        raw.pop("prev_market_position_size", None)
+        sig = dataclasses.replace(template, id="%s#r%d" % (template.id, n), fired_at=now, received_at=now,
+                                  price=float(price) if _finite(price) and float(price) else None,  # type: ignore[arg-type]
+                                  raw=raw)
+        if not self.store.insert_signal(sig):
+            self._resync_cancel(data, "re-sync %s already exists" % sig.id)
+            return
+        msg = ("re-sync %s: the strategy's newest alert %s still says %s %s units; opening %s again at the end "
+               "of the %s min lockout (re-sync %d of %d)" % (
+                   sig.id, root.id, "long" if side == "buy" else "short", root.target_units, symbol,
+                   m.resync_lockout_min, n, m.resync_max_per_trade))
+        log.info(msg)
+        self._event("info", "resync", msg, {"id": sig.id, "root": root.id, "n": n})
+        self.submit_signal(sig)
 
     def _sync_entry_block(self, sig: Signal) -> Optional[TradePlan]:
         """Why a sync may not open a position right now (age, halt, pause, flatten), or None."""
