@@ -105,6 +105,10 @@ class RiskCfg:
     # `tvbridge set-reference`. > 0: raise the estimate by this many percent as a safety margin
     # (tighter floors), store it as "stale_buffered" and keep trading; a warning is sent.
     stale_reference_buffer_pct: float = 0.0
+    # > 0: once today's closed profit (balance - today's daily reference) reaches this percent of
+    # initial_balance, new entries are refused until the next server day (open positions keep
+    # running). Keeps one day from dominating the total for firms with a best-day / consistency rule.
+    daily_profit_lock_pct: float = 0.0
 
 
 @dataclass
@@ -831,6 +835,8 @@ def validate(cfg: Config) -> None:
     _req(r.max_total_open_risk_pct > 0, "risk.max_total_open_risk_pct must be > 0")
     _req(0 <= r.stale_reference_buffer_pct <= 10,
          "risk.stale_reference_buffer_pct must be between 0 and 10 (got %s)" % (r.stale_reference_buffer_pct,))
+    _req(0 <= r.daily_profit_lock_pct <= 50,
+         "risk.daily_profit_lock_pct must be between 0 and 50 (got %s)" % (r.daily_profit_lock_pct,))
     _req(r.max_open_positions >= 1, "risk.max_open_positions must be >= 1 (got %d)" % r.max_open_positions)
     _req(r.max_trades_per_day >= 0, "risk.max_trades_per_day must be >= 0")
     _req(r.max_lots > 0, "risk.max_lots must be > 0")

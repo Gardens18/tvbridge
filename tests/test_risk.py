@@ -33,7 +33,7 @@ KNOWN_CODES = {
     "NO_DAY_REFERENCE", "UNTRACKED_POSITIONS", "NO_PRICE", "SL_MISSING", "SL_WRONG_SIDE", "TP_WRONG_SIDE",
     "SL_TOO_TIGHT", "OPPOSITE_OPEN", "PYRAMIDING", "MAX_POSITIONS", "MAX_TRADES_DAY", "NO_FX_RATE",
     "SIZE_TOO_SMALL", "TOTAL_OPEN_RISK", "BELOW_ENTRY_FLOOR", "WORST_CASE", "POSITIONS_UNCERTAIN",
-    "SL_MISSING_ON_SERVER",
+    "SL_MISSING_ON_SERVER", "DAILY_PROFIT_LOCK",
 }
 
 
@@ -696,7 +696,7 @@ class CheckOrderTests(Base):
 
     def test_cascade(self):
         cfg_holder = {"cfg": make_cfg({"reverse_on_opposite": False, "allow_pyramiding": False,
-                                        "max_open_positions": 2})}
+                                        "max_open_positions": 2, "daily_profit_lock_pct": 1.0})}
         sat = datetime(2026, 10, 3, 10, 0, tzinfo=UTC)
         sig = make_signal(action="close", tv_symbol="FOOBAR", symbol="FOOBAR.h", price=None, sl=None,
                           tp=None, risk_pct=0.0001, fired_at=NOW - timedelta(seconds=600))
@@ -711,7 +711,8 @@ class CheckOrderTests(Base):
         st.now = sat
 
         def set_cfg(**risk_over):
-            base = {"reverse_on_opposite": False, "allow_pyramiding": False, "max_open_positions": 2}
+            base = {"reverse_on_opposite": False, "allow_pyramiding": False, "max_open_positions": 2,
+                    "daily_profit_lock_pct": 1.0}
             cur = cfg_holder.get("risk_over", base)
             cur = dict(cur, **risk_over)
             cfg_holder["risk_over"] = cur
@@ -726,7 +727,9 @@ class CheckOrderTests(Base):
             ("STALE_SIGNAL", lambda: setattr(sig, "fired_at", NOW - timedelta(seconds=3))),
             ("NO_SNAPSHOT", lambda: setattr(st, "snapshot", make_snapshot(age_s=300))),
             ("SNAPSHOT_STALE", lambda: setattr(st, "snapshot", make_snapshot(balance=48800, equity=48400))),
-            ("NO_DAY_REFERENCE", lambda: setattr(st, "floors", compute_floors(50000, cfg_holder["cfg"]))),
+            ("NO_DAY_REFERENCE", lambda: (setattr(st, "floors", compute_floors(50000, cfg_holder["cfg"])),
+                                          setattr(st, "snapshot", make_snapshot(balance=50600, equity=48400)))),
+            ("DAILY_PROFIT_LOCK", lambda: setattr(st, "snapshot", make_snapshot(balance=48800, equity=48400))),
             ("UNTRACKED_POSITIONS", lambda: setattr(st, "untracked_positions", [])),
             ("POSITIONS_UNCERTAIN", lambda: setattr(st, "positions_uncertain", "")),
             ("SL_MISSING_ON_SERVER", lambda: setattr(st, "sl_issues", [])),
@@ -983,3 +986,21 @@ class PropertyTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DailyProfitLock(Base):
+    def test_off_by_default(self):
+        plan = self.plan(snapshot=make_snapshot(balance=53000.0, equity=53000.0))
+        self.assertTrue(plan.approved, plan.reason)
+
+    def test_locked_once_closed_profit_reaches_pct(self):
+        cfg = make_cfg(risk_over={"daily_profit_lock_pct": 2.0})       # 2% of 50,000 = 1,000
+        plan = self.plan(cfg=cfg, snapshot=make_snapshot(balance=51000.0, equity=51000.0))
+        self.assertCode(plan, "DAILY_PROFIT_LOCK")
+        plan = self.plan(cfg=cfg, snapshot=make_snapshot(balance=50999.0, equity=50999.0))
+        self.assertTrue(plan.approved, plan.reason)
+
+    def test_floating_profit_does_not_lock(self):
+        cfg = make_cfg(risk_over={"daily_profit_lock_pct": 2.0})
+        plan = self.plan(cfg=cfg, snapshot=make_snapshot(balance=50000.0, equity=52000.0))
+        self.assertTrue(plan.approved, plan.reason)

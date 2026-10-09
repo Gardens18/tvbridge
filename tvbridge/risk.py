@@ -391,6 +391,15 @@ def _plan_entry(sig: Signal, state: RiskState, cfg: Config) -> TradePlan:
         return _reject("NO_DAY_REFERENCE", "%s; check the Hantec dashboard and run `tvbridge set-reference VALUE`"
                        % state.reference_note)
 
+    # 7b. daily profit lock (firms with a best-day / consistency rule)
+    lock_pct = float(getattr(r, "daily_profit_lock_pct", 0.0) or 0.0)
+    if lock_pct > 0:
+        lock_usd = float(cfg.account.initial_balance) * lock_pct / 100.0
+        day_profit = balance - float(floors.reference)
+        if day_profit >= lock_usd:
+            return _reject("DAILY_PROFIT_LOCK", "closed profit today %s >= lock %s (daily_profit_lock_pct=%s); "
+                           "no new entries until the next server day" % (_usd(day_profit), _usd(lock_usd), lock_pct))
+
     # 8. untracked positions
     if r.block_untracked_positions and state.untracked_positions:
         names = ", ".join("%s %s %s" % (p.symbol, p.side, p.lots) for p in state.untracked_positions)
